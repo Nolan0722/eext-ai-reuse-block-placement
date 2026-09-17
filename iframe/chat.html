@@ -1,0 +1,1346 @@
+<!doctype html>
+<!--
+  复用模块 AI 对话助手（chat.html）
+  · 双模：无桥时 mock（浏览器预览）；EDA iframe 内走 eda.jlc_cbb_copilot.chatTurn
+  · 写画布 / 写库 / 导出必须经确认卡
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>复用模块 AI 助手</title>
+<style>
+  /* ── 设计令牌：对齐 jlc-work-stage 原型（品牌蓝点缀 + 亮/暗双主题）── */
+  :root{
+    --blue:#4f7fff; --blue-2:#3868ee;
+    --blue-soft:#4f7fff38; --blue-soft-hover:#4f7fff5c; --blue-line:#4f7fff66;
+    --bg:#f5f5f5; --panel:#ffffff; --panel-2:#fafafa; --input:#ffffff;
+    --well:#7373731f; --hover:#73737314; --selected:#7373731f;
+    --text:#171717; --text-2:#404040; --text-3:#646464; --meta:#a1a1a1;
+    --line:#7373731f; --line-2:#7373732e; --line-3:#7373735c;
+    --green:#23a55a; --green-soft:#23a55a1f;
+    --amber:#a97a10; --amber-soft:#f0b23229; --amber-line:#f0b23266;
+    --red:#da373c; --red-soft:#da373c14;
+    --code-bg:#0f172a; --code-fg:#e2e8f0;
+    --shadow:0 3px 9px 0 #1818180f;
+    --radius:12px; --radius-sm:8px;
+    --font:"SF Pro Text",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,
+           "PingFang SC","Microsoft YaHei","Hiragino Sans GB",Roboto,sans-serif;
+    color-scheme:light;
+  }
+  [data-theme="dark"]{
+    --blue-soft:#4f7fff38; --blue-soft-hover:#4f7fff5c; --blue-line:#4f7fff73;
+    --bg:#171717; --panel:#262626; --panel-2:#1d1d1d; --input:#262626;
+    --well:#ffffff14; --hover:#ffffff0f; --selected:#ffffff1a;
+    --text:#ededed; --text-2:#c9c9c9; --text-3:#9c9c9c; --meta:#8a8a8a;
+    --line:#ffffff14; --line-2:#ffffff24; --line-3:#ffffff47;
+    --green:#23a55a; --green-soft:#23a55a24;
+    --amber:#f0b232; --amber-soft:#f0b23224; --amber-line:#f0b23247;
+    --red:#f23f43; --red-soft:#f23f431f;
+    --shadow:0 3px 9px 0 #00000047;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    font:13px/1.6 var(--font);
+    color:var(--text); background:var(--bg);
+    transition:background-color .18s ease, color .18s ease;
+  }
+  #app{display:flex; flex-direction:column; height:100vh;
+       background:var(--panel);}
+  header{
+    display:flex; align-items:center; gap:14px; padding:0 14px 0 0; height:46px;
+    border-bottom:1px solid var(--line); background:var(--panel);
+    position:sticky; top:0; z-index:5; flex:none;
+  }
+  /* ── 顶部标签页（VS Code / Cursor 风格）：单标签承载会话，名称随首条用户消息，× 关闭即新会话 ── */
+  .tabs{display:flex; flex:1; min-width:0; align-self:stretch;}
+  .tab{
+    display:flex; align-items:center; gap:8px; min-width:0; max-width:240px;
+    height:100%; padding:0 7px 0 13px; margin-bottom:-1px;
+    border:1px solid transparent; border-bottom:none;
+    cursor:pointer; user-select:none; color:var(--text-3); font-weight:500; font-size:13px;
+  }
+  .tab:hover{background:var(--hover); color:var(--text-2);}
+  .tab.on{background:var(--panel); border-color:var(--line); color:var(--text); font-weight:600;
+    box-shadow:inset 0 3px 0 var(--blue);}
+  .tab .tab-label{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .tab .tab-close{flex:none; width:18px; height:18px; padding:0; border:none;
+    background:none; color:inherit; opacity:.5; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;}
+  .tab .tab-close svg{width:12px; height:12px; display:block;}
+  .tab .tab-close:hover{background:var(--hover); opacity:1; color:var(--text);}
+  /* 扁平线性图标按钮（设置 / 主题），与工具行 SVG 同一视觉语言 */
+  .icon-btn{width:30px; height:30px; flex:none; border:none; border-radius:8px;
+    background:none; cursor:pointer; color:var(--text-3);
+    display:flex; align-items:center; justify-content:center;
+    transition:background .16s ease, color .16s ease;}
+  .icon-btn svg{display:block; width:17px; height:17px;}
+  .icon-btn:hover{background:var(--hover); color:var(--text);}
+  .icon-btn.on{color:var(--blue); background:var(--blue-soft);}
+  #hdBtns{display:flex; align-items:center; gap:2px; flex:none;}
+  /* 右上角状态 chip：常态（真桥 + 模型已配置）不显示，仅异常时出现 */
+  .status{display:none; align-items:center; gap:6px; font-size:12px; padding:3px 10px;
+    border-radius:12px; white-space:nowrap;}
+  .status.show{display:flex;}
+  .status.warn{background:var(--amber-soft); color:var(--amber);}
+  .status.click{cursor:pointer;}
+  .status.click:hover{background:var(--amber-line);}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--amber);flex:none;}
+  main{flex:1; min-height:0; display:flex; flex-direction:column;}
+  .page{flex:1; min-height:0; display:none; flex-direction:column;}
+  .page.on{display:flex;}
+  #msgList{flex:1; overflow-y:auto; padding:0 16px 6px; scrollbar-width:none;}
+  #msgList::-webkit-scrollbar{display:none;}
+  /* 消息分段：每条用户消息开启一段，用户气泡在段内滚动吸顶，直至被下一条用户消息顶替 */
+  .seg{display:flex; flex-direction:column; min-width:0;}
+  .col{display:flex; flex-direction:column; margin-bottom:14px; min-width:0;}
+  .col.user{align-items:stretch; position:sticky; top:0; z-index:5;
+    background:var(--panel); padding:0 0 6px; margin-bottom:8px;}
+  .col.ai{align-items:stretch;}
+  /* 首段以 AI 内容开头时（欢迎语/状态提示）给顶部留一点呼吸，用户气泡开头则贴住 header */
+  .seg:first-child .col.ai:first-child, .seg:first-child .sysnote:first-child{ padding-top:12px; }
+  .bubble{width:100%; padding:9px 13px; border-radius:12px; word-break:break-word;}
+  .bubble.user{background:var(--selected); color:var(--text); border:1px solid var(--line-3);}
+  .ai-body b{color:inherit; font-weight:700;}
+  .caret{display:inline-block;width:7px;height:14px;background:var(--blue);
+    vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite;}
+  @keyframes blink{50%{opacity:0;}}
+  /* ── AI 消息富文本（Markdown-lite）：全宽 · 无气泡包裹 ── */
+  .ai-body{width:100%; word-break:break-word;}
+  .ai-body p{margin:0;}
+  .ai-body h1,.ai-body h2,.ai-body h3{font-size:13.5px; margin:8px 0 4px; line-height:1.5;}
+  .ai-body h1{font-size:14.5px;}
+  .ai-body ul,.ai-body ol{margin:4px 0; padding-left:20px;}
+  .ai-body li{margin:2px 0;}
+  .ai-body ul ul,.ai-body ol ol,.ai-body ul ol,.ai-body ol ul{margin:2px 0;}
+  .ai-body pre.md-code{background:var(--code-bg); color:var(--code-fg); border-radius:8px; padding:8px 11px;
+    margin:6px 0; overflow-x:auto; white-space:pre;}
+  .ai-body pre.md-code code{font:11.5px/1.6 Consolas,Menlo,monospace; color:inherit; background:none; padding:0; border:none;}
+  .ai-body pre.md-code[data-lang]::before{content:attr(data-lang); display:block; font-size:10px;
+    color:var(--meta); margin-bottom:4px; letter-spacing:.05em;}
+  .ai-body code.md-inline{background:var(--well); border:1px solid var(--line); border-radius:4px;
+    padding:0 4px; font:11.5px Consolas,Menlo,monospace; color:var(--text);}
+  .ai-body blockquote{border-left:3px solid var(--line-3); background:var(--well);
+    padding:4px 10px; margin:6px 0; border-radius:0 6px 6px 0; color:var(--text-2);}
+  .ai-body hr{border:none; border-top:1px dashed var(--line); margin:8px 0;}
+  .ai-body a{color:var(--text); text-decoration:underline;}
+  .ai-body s{color:var(--text-3);}
+  .ai-body table.md-table{border-collapse:collapse; font-size:12px; margin:6px 0; max-width:100%;}
+  .ai-body table.md-table th,.ai-body table.md-table td{border:1px solid var(--line); padding:3px 8px; text-align:left;}
+  .ai-body table.md-table th{background:var(--panel-2); font-weight:600;}
+  .sysnote{text-align:center; color:var(--text-3); font-size:12px; margin:10px 0;}
+  /* 工具调用：运行中「⟳ Working for Xs · 工具名」（旋转 + 闪烁），结束 Worked for Xs；
+     右侧箭头展开详情 */
+  .tool{width:100%; max-width:100%; margin-bottom:2px;}
+  .tool-line{display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none;
+    color:var(--text-3); font-size:12.5px; line-height:1.4; padding:3px 0; width:100%;}
+  .tool-line:hover{color:var(--text-2);}
+  .tool-spin{flex:none; width:12px; height:12px; display:none; color:var(--blue);}
+  .tool-spin svg{display:block; width:12px; height:12px; overflow:visible;}
+  .tool.running .tool-spin{display:block;}
+  .tool.running .tool-spin svg{animation:tool-rotate .9s linear infinite;}
+  .tool.running .tool-label{animation:tool-pulse 1.4s ease-in-out infinite;}
+  .tool.running .tool-line{color:var(--text-2);}
+  @keyframes tool-rotate{to{transform:rotate(360deg);}}
+  @keyframes tool-pulse{0%,100%{opacity:1;}50%{opacity:.45;}}
+  .tool-line .tool-label{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  /* 整轮计时组：展开显示本轮工具行，收起隐藏 */
+  .tool .tool-sub{display:none; flex-direction:column; padding-left:19px;}
+  .tool.work.open .tool-sub{display:flex;}
+  /* 固定正方形盒：箭头居中于盒内，旋转以盒中心为原点，展开时不会横向漂移 */
+  .tool-line .tool-caret{flex:0 0 14px; width:14px; height:14px; display:block;
+    transform-origin:50% 50%; transition:transform .15s ease;}
+  .tool-line .tool-caret svg{display:block; width:14px; height:14px; overflow:visible;}
+  .tool.open > .tool-line .tool-caret{transform:rotate(90deg);}
+  .tool-detail{display:none; margin:2px 0 6px; padding:8px 11px;
+    font:11px/1.5 Consolas,Menlo,monospace; color:var(--text-2); white-space:pre-wrap; word-break:break-all;
+    max-height:180px; overflow-y:auto; background:var(--panel-2); border:1px solid var(--line); border-radius:8px;}
+  .tool-detail:empty{display:none !important;}
+  .tool.open > .tool-detail{display:block;}
+  .card{
+    width:100%; max-width:100%; border:1px solid var(--line); border-radius:16px;
+    background:var(--panel); box-shadow:var(--shadow); overflow:hidden;
+  }
+  /* 统一卡头：图标 + 标题 + 可折叠详情箭头（Claude/Cursor 式卡片语言） */
+  .card-hd{display:flex; align-items:center; gap:9px; padding:12px 14px; font-weight:600; font-size:12.5px;
+    cursor:pointer; user-select:none;}
+  .card-hd .caret-box{flex:0 0 14px; width:14px; height:14px; color:var(--text-3);
+    transition:transform .15s ease; transform-origin:50% 50%;}
+  .card.open .card-hd .caret-box{transform:rotate(90deg);}
+  .card-hd .caret-box svg{display:block; width:14px; height:14px; overflow:visible;}
+  .card-hd .hd-status{margin-left:auto; font-size:11px; font-weight:500; flex:none;}
+  .card-bd{padding:2px 14px 12px;}
+  .card-foot{display:flex; align-items:center; gap:8px; padding:10px 14px 14px;}
+  .card-foot .spacer{flex:1;}
+  .card .hint{font-size:11.5px; color:var(--text-3); margin-top:6px;}
+  .card.dead{opacity:.45; pointer-events:none;}
+  .card.dead .hd-status{color:var(--red);}
+  .card.dead .hd-status::after{content:"已作废";}
+  .card.done{opacity:.75; pointer-events:none;}
+  .card.done .hd-status{color:var(--green);}
+  .card.done .hd-status::after{content:"已处理";}
+  .card.risk{opacity:.72;}
+  /* 卡头点击折叠：默认 open，收起时隐藏正文与详情，只留标题行 */
+  .card-detail{margin:0 14px 12px; padding:8px 10px; font:11px/1.5 Consolas,Menlo,monospace; color:var(--text-2);
+    white-space:pre-wrap; word-break:break-all; background:var(--panel-2); border:1px solid var(--line); border-radius:8px;
+    max-height:180px; overflow-y:auto;}
+  .card:not(.open) .card-bd, .card:not(.open) .card-detail{display:none;}
+  /* 卡内逐项行（Claude/Cursor 式 item 行）：勾选框 + 主信息 + 右侧行内控件 */
+  .pick-item{display:flex; align-items:center; gap:9px; padding:8px 10px; border:1px solid var(--line);
+    border-radius:10px; margin-bottom:6px; background:var(--panel-2);}
+  .pick-item input[type=checkbox]{flex:none;}
+  .pick-item .pi-main{flex:1; min-width:0;}
+  .pick-item .pi-title{font-weight:600; font-size:12.5px; display:flex; align-items:center; gap:6px; flex-wrap:wrap;}
+  .pick-item .pi-reason{color:var(--text-3); font-size:11px; display:block; margin-top:2px;}
+  .pick-item .pi-ctrls{flex:none; display:flex; gap:6px; margin-left:auto; justify-content:flex-end; flex-wrap:wrap;}
+  .pick-item select, .pick-item input[type=number]{
+    padding:5px 9px; border:1px solid var(--line); border-radius:7px; font-size:12.5px;
+    background:var(--panel); color:var(--text-2); max-width:150px;}
+  .pick-item select:disabled{opacity:.45;}
+  .pick-src{color:var(--text-3); font-size:11px;}
+  .btn{
+    padding:5px 14px; border-radius:7px; border:1px solid var(--line-3); background:var(--panel);
+    cursor:pointer; font-size:12.5px; color:var(--text);
+  }
+  .btn:hover{border-color:var(--blue); color:var(--blue);}
+  .btn.primary{background:var(--blue); border-color:var(--blue); color:#fff; font-weight:500;}
+  .btn.primary:hover{background:var(--blue-2); color:#fff;}
+  .btn:disabled{opacity:.5; cursor:not-allowed;}
+  .btn.link{border:none; background:none; color:var(--blue); padding:2px 4px; text-decoration:underline;}
+  /* ── 空会话首屏（Gemini 风格）：大字问候 + 建议选项（复用 chips 点击逻辑），首条消息后隐藏 ── */
+  #hero{display:none; flex-direction:column; align-items:center; justify-content:center;
+    gap:18px; flex:1; min-height:0; padding:24px 16px; text-align:center;}
+  #page-chat.empty #hero{display:flex;}
+  #page-chat.empty #msgList{display:none;}
+  .hero-greet{font-size:30px; line-height:1.45; font-weight:700; color:var(--text-3); letter-spacing:.5px;}
+  .hero-greet b{font-weight:700; color:var(--blue);}
+  .hero-sub{font-size:13px; line-height:1.7; color:var(--text-3); max-width:480px;}
+  #chips{display:flex; flex-wrap:wrap; justify-content:center; gap:9px; max-width:620px;}
+  /* 对话中的建议条：横滑（恢复原样式），空会话首屏显示时不出现 */
+  #chipsBar{flex:none; display:flex; gap:8px; padding:6px 16px; overflow-x:auto; scrollbar-width:none;}
+  #chipsBar::-webkit-scrollbar{display:none;}
+  #page-chat.empty #chipsBar{display:none;}
+  .chip{flex:none; padding:6px 14px; border:1px solid var(--line); border-radius:10px;
+    background:var(--panel); font-size:12.5px; color:var(--text-2); cursor:pointer;}
+  .chip:hover{border-color:var(--blue); color:var(--blue);}
+  #composer{flex:none; padding:8px 16px 14px;}
+  /* 输入框：外层圆角容器（对齐 jlc-work-stage 原型 .composer），底色/描边对齐用户气泡，默认单行高 */
+  .composer-box{border:1px solid var(--line-3); background:var(--selected); border-radius:16px;
+    transition:border-color .16s ease; overflow:hidden;}
+  .composer-box:focus-within{border-color:var(--blue-line);}
+  #input{
+    display:block; width:100%; max-height:132px; resize:none;
+    background:none; border:none; outline:none;
+    padding:10px 14px; font:13px/20px inherit; font-family:inherit; color:var(--text);
+  }
+  #input::placeholder{color:var(--meta);}
+  .composer-foot{display:flex; align-items:center; gap:6px; min-height:40px; padding:4px 8px 8px 14px;}
+  .composer-foot .spacer{flex:1;}
+  .composer-hint{font-size:11px; color:var(--meta); user-select:none;}
+  .composer-hint b{font-weight:500; color:var(--text-3);}
+  #send{flex:none; width:32px; height:32px; padding:0; border:none; border-radius:8px;
+    background:var(--blue-soft); color:var(--blue); cursor:pointer;
+    display:grid; place-items:center; transition:background .16s ease, color .16s ease;}
+  #send svg{display:block; width:16px; height:16px;}
+  #send:not(:disabled){background:var(--blue); color:#fff;}
+  #send:not(:disabled):hover{background:var(--blue-2);}
+  #send:disabled{cursor:not-allowed;}
+  #page-settings{overflow-y:auto; padding:18px 20px 30px; display:none;}
+  #page-settings.on{display:block;}
+  .sec{border:1px solid var(--line); border-radius:var(--radius); background:var(--panel);
+    margin-bottom:16px; overflow:hidden;}
+  .sec-hd{padding:10px 15px; font-weight:600; font-size:13px; background:var(--panel-2); border-bottom:1px solid var(--line);
+    display:flex; align-items:center; gap:8px;}
+  .sec-bd{padding:13px 15px;}
+  .frow{display:flex; align-items:center; gap:10px; margin-bottom:10px;}
+  .frow label{width:88px; flex:none; color:var(--text-2); font-size:12.5px; text-align:right;}
+  .frow .fctl{flex:1; min-width:0; display:flex; align-items:center; gap:8px;}
+  .frow input[type=text], .frow input[type=password], .frow select{
+    flex:1; padding:6px 10px; border:1px solid var(--line); border-radius:7px;
+    font:12.5px/1.5 inherit; font-family:inherit; min-width:0; outline:none;}
+  .frow input:focus{border-color:var(--blue);}
+  /* 放置排布：紧凑双行网格（间距 + 标注框三参数） */
+  .prow{display:flex; align-items:center; flex-wrap:wrap; gap:6px 14px; margin-bottom:9px;}
+  .plabel{flex:none; width:60px; color:var(--text-2); font-size:12.5px;}
+  .pitem{display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--text-3);}
+  .pitem input{width:64px; padding:4px 8px; border:1px solid var(--line); border-radius:6px;
+    font-size:12px; background:var(--panel); color:var(--text); outline:none;}
+  .pitem input:focus{border-color:var(--blue);}
+  .pitem input[type=text]{width:96px;}
+  .punit{font-size:11px; color:var(--meta);}
+  .pnote{font-size:11px; color:var(--meta); margin-top:2px;}
+  .note{font-size:11.5px; color:var(--text-3); margin:2px 0 10px; padding-left:98px;}
+  .note.flush{padding-left:0;}
+  /* 库范围只读展示行：来源名 + 可用性徽标（三源直测结果，用户不可更改） */
+  .scoperow{display:flex; align-items:center; gap:8px; padding:7px 10px; border:1px solid var(--line);
+    border-radius:8px; margin-bottom:6px; background:var(--panel-2);}
+  .scoperow b{flex:1; font-size:12.5px;}
+  .scope-badge{flex:none; font-size:11px; padding:2px 8px; border-radius:8px; font-weight:500;}
+  .scope-badge.ok{color:var(--green); background:var(--green-soft);}
+  .scope-badge.bad{color:var(--red); background:var(--red-soft);}
+  .opresult{font-size:12px; margin-top:4px; padding:7px 11px; border-radius:7px; display:none;}
+  .opresult.ok{display:block; background:var(--green-soft); color:var(--green);}
+  .opresult.err{display:block; background:var(--red-soft); color:var(--red);}
+  .env{font-size:11.5px; color:var(--text-2); background:var(--panel-2); border:1px solid var(--line);
+    border-radius:7px; padding:6px 10px; margin-bottom:10px;}
+  .env.warn{background:var(--amber-soft); border-color:var(--amber-line);}
+  pre.diag{font:11px/1.6 Consolas,Menlo,monospace; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:7px; padding:10px; white-space:pre-wrap; word-break:break-all; display:none; margin-top:8px;}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <nav class="tabs">
+      <div class="tab on" id="chatTab" data-page="chat" title="复用模块助手">
+        <span class="tab-label" id="chatTabLabel">复用模块助手</span>
+        <button class="tab-close" id="chatTabClose" type="button" title="关闭会话（开始新对话）">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </nav>
+    <div class="status" id="status"><span class="dot"></span><span id="statusText"></span></div>
+    <div id="hdBtns">
+      <button class="icon-btn" id="clearChatBtn" type="button" title="清空对话（新会话）">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon-btn" id="settingsBtn" type="button" title="设置">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="1.7"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="icon-btn" id="themeBtn" type="button" title="切换亮 / 暗主题">
+        <svg class="ico-moon" viewBox="0 0 24 24" fill="none"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg class="ico-sun" viewBox="0 0 24 24" fill="none" style="display:none"><circle cx="12" cy="12" r="4.2" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </header>
+  <main>
+    <section class="page on empty" id="page-chat">
+      <div id="hero">
+        <div class="hero-greet">你好，我是<br><b>复用模块 AI 助手</b></div>
+        <div class="hero-sub">可以帮你从复用模块库找模块并放置、按模板补写描述、导出全库目录。</div>
+        <div id="chips"></div>
+      </div>
+      <div id="msgList"></div>
+      <div id="chipsBar"></div>
+      <div id="composer">
+        <div class="composer-box">
+          <textarea id="input" rows="1" placeholder="描述你的需求，如：找一个 5V 转 3.3V 的电源模块…"></textarea>
+          <div class="composer-foot">
+            <span class="composer-hint"><b>Enter</b> 发送 · <b>Shift+Enter</b> 换行</span>
+            <span class="spacer"></span>
+            <button id="send" title="发送 (Enter)" disabled><svg viewBox="0 0 24 24" fill="none"><path d="M12 19V6M12 5l-6.5 6.5M12 5l6.5 6.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="page" id="page-settings">
+      <div class="sec">
+        <div class="sec-hd">模型接入</div>
+        <div class="sec-bd">
+          <div class="frow"><label>API 格式</label><div class="fctl">
+            <select id="setFormat">
+              <option value="openai-chat">openai-chat</option>
+              <option value="openai-responses">openai-responses</option>
+              <option value="anthropic">anthropic</option>
+            </select>
+          </div></div>
+          <div class="frow"><label>baseUrl</label><div class="fctl">
+            <input type="text" id="setBase" value="" placeholder="https://…/v1">
+          </div></div>
+          <div class="frow"><label>apiKey</label><div class="fctl">
+            <input type="password" id="setKey" value="" placeholder="仅存本地">
+            <button class="btn" id="toggleKey" type="button">显示</button>
+          </div></div>
+          <div class="frow"><label>model</label><div class="fctl">
+            <input type="text" id="setModel" value="" placeholder="如 deepseek-chat / claude-sonnet-4-5">
+          </div></div>
+          <div class="frow"><label></label><div class="fctl">
+            <button class="btn primary" id="saveSettings">保存设置</button>
+            <button class="btn" id="testConn">测试连接</button>
+          </div></div>
+          <div class="opresult" id="connResult"></div>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="sec-hd">库范围</div>
+        <div class="sec-bd">
+          <div class="env" id="envLine" hidden></div>
+          <div id="scopeList"><div class="scoperow"><b>检测中…</b></div></div>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="sec-hd">放置排布</div>
+        <div class="sec-bd">
+          <div class="prow">
+            <span class="plabel">模块间距</span>
+            <span class="pitem">水平 <input type="number" id="setGapX" min="1" step="10"></span>
+            <span class="pitem">垂直 <input type="number" id="setGapY" min="1" step="10"></span>
+            <span class="punit">0.01 英寸</span>
+          </div>
+          <div class="prow">
+            <span class="plabel">标注框</span>
+            <span class="pitem">颜色 <input type="text" id="setBorderColor" placeholder="留空 = 默认"></span>
+            <span class="pitem">线宽 <input type="number" id="setBorderWidth" min="1" step="1" placeholder="默认"></span>
+            <span class="pitem">边距 <input type="number" id="setMargin" min="0" step="10" placeholder="40"></span>
+          </div>
+          <div class="pnote">模块自动按对齐网格排布并避开已占用区域；标注标题固定红色 · 0.2inch · 居中。保存后下次放置生效。</div>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="sec-hd">本地库复用</div>
+        <div class="sec-bd">
+          <div class="prow">
+            <button class="btn" id="btnExportPkg">导出工程包 zip</button>
+            <button class="btn" id="btnImportPkg">导入工程包 zip</button>
+          </div>
+          <div class="pnote">本地库复用模块的全部导出和导入；云端模块数据在服务器，不参与打包，导入后模块未出现请重启客户端。</div>
+          <pre class="diag" id="pkgOut" style="display:none"></pre>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="sec-hd">关于</div>
+        <div class="sec-bd" style="font-size:12px; color:var(--text-2);">
+          复用模块 AI 对话助手 · jlc-cbb-copilot v0.6.0<br>
+          自然语言找模块、确认后放置、改描述、导出目录。写操作必须经确认卡。
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script>
+(function () {
+  const SESSION_ID = 'cbb-chat-' + Date.now().toString(36);
+  const $ = s => document.querySelector(s);
+  const msgList = $('#msgList');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  let busy = false;
+  const liveCards = [];
+
+  /* ── 消息分段：一条用户消息与其后的 AI 回复 / 工具调用 / 确认卡归入同一段。
+     用户气泡 position:sticky 在段内吸顶：滚动浏览时暂留顶部，
+     直到下一条用户消息滚动到同一位置时将其顶替。── */
+  let curSeg = null;
+  function ensureSeg() {
+    if (!curSeg) {
+      curSeg = document.createElement('div');
+      curSeg.className = 'seg';
+      msgList.appendChild(curSeg);
+    }
+    return curSeg;
+  }
+
+  function edaSources() {
+    const out = [];
+    try { if (typeof eda !== 'undefined' && eda) out.push(eda); } catch (e) {}
+    try { if (window.parent && window.parent.eda) out.push(window.parent.eda); } catch (e) {}
+    try { if (window.top && window.top.eda && window.top !== window.parent) out.push(window.top.eda); } catch (e) {}
+    return out.filter((v, i, a) => a.indexOf(v) === i);
+  }
+  function findRealBridge() {
+    const srcs = edaSources();
+    for (let i = 0; i < srcs.length; i++) {
+      const b = srcs[i] && srcs[i].jlc_cbb_copilot;
+      if (b && typeof b.chatTurn === 'function') return b;
+    }
+    return null;
+  }
+
+  const MOCK_MODULES = [
+    { uuid: 'cbb-ams1117-3v3', name: 'DCDC-5V转3.3V-AMS1117', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['电源', 'LDO'], reason: '线性稳压，压差 1.7V，适合小电流 3.3V 供电。',
+      description: '输入 5V，输出 3.3V/800mA。AMS1117-3.3，SOT-223。' },
+    { uuid: 'cbb-mp1584-3v3', name: 'DCDC-5V转3.3V-MP1584', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['电源', 'DCDC'], reason: '开关降压，效率高、支持 3A 输出。',
+      description: '输入 4.5-28V，输出 3.3V/3A。MP1584EN。' },
+    { uuid: 'cbb-esp32c3-core', name: 'ESP32-C3最小系统', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['主控', 'WiFi'], reason: 'RISC-V 单核，内置 WiFi/BLE。',
+      description: 'ESP32-C3FN4，含去耦、晶振、复位与 Boot。' },
+    { uuid: 'cbb-tp4056', name: '锂电池充电-TP4056', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['电源', '充电'], reason: '单节锂电线性充电 1A。',
+      description: 'USB Type-C 输入，TP4056 1A 充电。' },
+    { uuid: 'cbb-usb-typec', name: 'USB-TypeC-5V输入接口', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['接口', 'USB'], reason: 'Type-C 母座 5V 取电。',
+      description: '16P Type-C 母座，5.1k CC 下拉。' },
+    { uuid: 'cbb-rs485', name: 'RS485-自动收发', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['接口', 'RS485'], reason: 'MAX3485 自动收发方向控制。',
+      description: 'MAX3485，3.3V，AB 线 120R + TVS。' },
+    { uuid: 'cbb-stm32f103', name: 'STM32F103C8T6最小系统', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['主控', 'MCU'], reason: '经典蓝 pill 核心。',
+      description: 'STM32F103C8T6，8MHz 晶振、SWD。' },
+    { uuid: 'cbb-filter-pi', name: '电源滤波-π型', libraryKind: 'personal', src: '个人库', pageSupport: true,
+      classification: ['电源', '滤波'], reason: '共模+差模 π 型滤波。', description: '' },
+    { uuid: 'cbb-can-tja1051', name: 'CAN收发-TJA1051', libraryKind: 'local', src: '本地库', pageSupport: false,
+      classification: ['接口', 'CAN'], reason: '本地库示例：复用模块图页不可用。',
+      description: 'TJA1051 5Mbps CAN 收发器。' },
+    { uuid: 'cbb-team-wheel', name: '滚轮模块', libraryKind: 'team', src: '团队test', pageSupport: true,
+      classification: ['人机交互'], reason: '团队库示例：云端全链路可用。',
+      description: '旋转编码器人机输入，用于参数调节与确认操作。' },
+  ];
+  const MOCK_CATALOG = {
+    stats: { libraries: 3, modules: MOCK_MODULES.length, emptyDesc: 1, failed: 0, elapsedMs: 1218 },
+    libraries: [
+      { libraryUuid: 'lib-personal', moduleName: '个人库', libraryKind: 'personal', failed: false, error: null,
+        modules: MOCK_MODULES.filter(m => m.libraryKind === 'personal') },
+      { libraryUuid: 'lib-team-test', moduleName: '团队test', libraryKind: 'team', failed: false, error: null,
+        modules: MOCK_MODULES.filter(m => m.libraryKind === 'team') },
+      { libraryUuid: 'C:\\\\Users\\\\JLC\\\\Documents\\\\LCEDA-Pro\\\\libraries', moduleName: '本地库', libraryKind: 'local', failed: false, error: null,
+        modules: MOCK_MODULES.filter(m => m.libraryKind === 'local') },
+    ],
+  };
+
+  let mockCatalog = null;
+  let mockTokenSeq = 1;
+  const mockOpenTokens = new Map();
+
+  function mockAllModules() {
+    const cat = mockCatalog || MOCK_CATALOG;
+    const out = [];
+    cat.libraries.forEach(l => (l.modules || []).forEach(m => out.push({
+      uuid: m.uuid, name: m.name, description: m.description || '', src: l.moduleName,
+      libraryUuid: l.libraryUuid, libraryKind: l.libraryKind,
+      pageSupport: l.libraryKind === 'personal' || l.libraryKind === 'team',
+      classification: (m.classification || []).join('/'),
+      reason: m.reason || '（见描述）',
+    })));
+    return out;
+  }
+
+  const mockBridge = {
+    version: '0.4.0-mock',
+    getLlmSettings() { return { provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value }; },
+    saveLlmSettings() { return; },
+    getLibraryScope() { return { personal: true, team: true, local: true }; },
+    saveLibraryScope() { return; },
+    getLocalLibraryPath() { return ''; },
+    saveLocalLibraryPath() { return; },
+    getProjectDirs() { return ''; },
+    saveProjectDirs() { return; },
+    async importProjectPackage() { return { ok: true, imported: [], failed: [], targetDir: '', note: '浏览器 mock 未写入磁盘。' }; },
+    getPlacementSettings() { return { gapX: 80, gapY: 80, borderColor: '', borderWidth: null, margin: 40 }; },
+    savePlacementSettings() { return; },
+    async chatTurn(_sid, userText) {
+      await sleep(400);
+      const t = String(userText || '');
+      const tools = [];
+      const cards = [];
+      if (!mockCatalog) {
+        await sleep(500);
+        mockCatalog = MOCK_CATALOG;
+        tools.push({ name: 'get_catalog', argsSummary: '会话首次拉取', status: 'ok', detail: mockCatalog.stats });
+      }
+      if (/导出/.test(t)) {
+        const token = 'mock-export-' + mockTokenSeq++;
+        mockOpenTokens.set(token, 'export');
+        cards.push({ type: 'export', token, stats: mockCatalog.stats });
+        return { assistantText: '导出前先确认统计信息（不含 apiKey）。', tools, cards, llmConfigured: true };
+      }
+      if (/(描述|名称|名字).*(改|换|修|补|写|规范)|^(改|修|补|编辑|帮).*(描述|名称|名字)/.test(t)) {
+        const empty = mockAllModules().find(m => !m.description) || mockAllModules()[0];
+        const token = 'mock-edit-' + mockTokenSeq++;
+        mockOpenTokens.set(token, 'edit');
+        cards.push({ type: 'edit', token, libraryUuid: empty.libraryUuid, cbbUuid: empty.uuid, src: empty.src, origName: empty.name, name: empty.name, description: empty.description });
+        return { assistantText: `找到模块 **${empty.name}**（${empty.src}）。${empty.description ? '可在卡片中修改。' : '描述为空，建议按模板补写。'}`, tools, cards, llmConfigured: true };
+      }
+      if (/(失败|断网|错误|401|404|429|超时|鉴权)/.test(t)) {
+        tools.push({ name: 'llm.request', argsSummary: 'anthropic', status: 'err', error: '401', detail: 'HTTP 401 authentication_error' });
+        return { assistantText: '调用模型端点失败了：**鉴权失败**——通常是 apiKey 无效或已过期。请到 设置 → 模型接入 检查 Key。', tools, cards, gotoSettings: true, llmConfigured: true, error: { kind: 'auth', message: '401', gotoSettings: true } };
+      }
+      if (/千兆|以太网|PHY/.test(t)) {
+        return { assistantText: '目录中没有匹配「千兆以太网 PHY」的模块。\n建议把开源广场模块复制到个人库后再刷新目录（插件不覆盖开源广场）。', tools, cards, llmConfigured: true };
+      }
+      if (/(本地|边界|整页.*不支持|图页.*不支持|能力)/.test(t)) {
+        const local = mockAllModules().find(m => m.libraryKind === 'local');
+        const token = 'mock-place-' + mockTokenSeq++;
+        mockOpenTokens.set(token, 'place');
+        cards.push({ type: 'place', token, filtered: [], picks: [{ uuid: local.uuid, libraryUuid: local.libraryUuid, name: local.name, src: local.src, reason: local.reason, pageSupport: false, mode: 'symbol', target: 'current' }] });
+        return { assistantText: `以本地库模块 **${local.name}** 演示：支持符号放置（带标注）与编辑，**不支持复用模块图页**（get 接口对本地模块会崩溃）。云端个人库与团队库都是全链路可用库。\n\n半离线模式需在设置里按 config.json 的 \`LIB_DIR\` 填本地库路径：\n\n\`\`\`json\n{ "type": "HALF_OFFLINE", "LIB_DIR": ["D:/LCEDA-Pro/library"] }\n\`\`\``, tools, cards, llmConfigured: true };
+      }
+      if (/(刷新|重新拉).*(目录|列表)|目录.*(刷新)|^(有|列)(哪|什么)|有哪些?模块|模块列表|^目录$/.test(t)) {
+        mockCatalog = MOCK_CATALOG;
+        tools.push({ name: 'get_catalog', argsSummary: 'force 刷新', status: 'ok', detail: mockCatalog.stats });
+        return { assistantText: `目录已刷新，共 ${MOCK_MODULES.length} 个模块：\n\n| 库 | 模块数 | 能力 |\n|---|---|---|\n| 个人库（云端） | ${MOCK_MODULES.filter(m => m.libraryKind === 'personal').length} | 目录 / 符号 / 图页 / 编辑 |\n| 本地库 | ${MOCK_MODULES.filter(m => m.libraryKind === 'local').length} | 目录 / 符号 / 编辑，**不支持图页** |\n\n${mockCatalog.stats.emptyDesc ? '⚠ 有 1 个模块**描述为空**，会影响匹配质量，需要我帮你补写吗？' : '要我列出某一类模块吗？'}`, tools, cards, llmConfigured: true };
+      }
+      if (/(模块|放置|候选|电源|转换|最小系统|充电|滤波|串口|485|CAN)/i.test(t)) {
+        let picks = mockAllModules().filter(m => /3\.3|电源|LDO|DCDC|降压|稳压/i.test(m.classification + m.name + t));
+        if (!picks.length) picks = mockAllModules().slice(0, 2);
+        picks = picks.filter(m => m.libraryKind === 'personal').slice(0, 3);
+        const token = 'mock-place-' + mockTokenSeq++;
+        mockOpenTokens.set(token, 'place');
+        const view = picks.map((p, i) => ({ uuid: p.uuid, libraryUuid: p.libraryUuid, name: p.name, src: p.src, reason: p.reason, pageSupport: p.pageSupport, mode: p.pageSupport ? 'page' : 'symbol', target: 'current' }));
+        cards.push({ type: 'place', token, picks: view, filtered: [] });
+        const lines = picks.map((p, i) => `${i + 1}. **${p.name}**（${p.src}）—— ${p.reason}`).join('\n');
+        return { assistantText: `根据「${t}」，筛出 ${picks.length} 个候选：\n${lines}\n\n请在确认卡上确认后放置，落点由插件自动排布并避开已有内容。`, tools, cards, llmConfigured: true };
+      }
+      return { assistantText: '我可以帮你：找模块并放置、按模板改描述、导出目录 JSON。放置位置可选当前图页、新建图页、新建板子或新建工程。试着说一个，或点下方建议。', tools, cards, llmConfigured: true };
+    },
+    async confirmPlace(_sid, token, items) {
+      if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
+      mockOpenTokens.delete(token);
+      await sleep(800);
+      return { results: items.map(it => ({ cbbUuid: it.cbbUuid, name: it.name, ok: true })) };
+    },
+    async confirmEdit(_sid, token) {
+      if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
+      mockOpenTokens.delete(token);
+      await sleep(600);
+      return { ok: true };
+    },
+    async confirmExport(_sid, token, uuids) {
+      if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
+      mockOpenTokens.delete(token);
+      await sleep(700);
+      return { ok: true, fileCount: 0, cloudCount: (uuids || []).length, fileName: 'mock.zip', failed: [], stats: MOCK_CATALOG.stats };
+    },
+    cancelCard(_sid, token) { mockOpenTokens.delete(token); },
+    resetChatSession() { mockCatalog = null; mockOpenTokens.clear(); },
+    async selfCheck() {
+      await sleep(400);
+      return '⚠ 当前为浏览器 mock，未注入 eda。\n在嘉立创EDA中打开本面板后走真桥自检。';
+    },
+    async getClientEnv() {
+      await sleep(200);
+      return {
+        mode: 'online', modeSource: 'probe', isWeb: false, isClient: true,
+        edition: 'jlc-eda-pro', appVersion: '3.2.166', compliedDate: '',
+        username: 'demo', userUuid: 'demo-user-uuid', login: true,
+        personalAvailable: true, teamAvailable: true, localAvailable: false,
+        notes: ['浏览器 mock：演示在线模式（本地库不可达）'],
+      };
+    },
+    async testConnection() {
+      await sleep(600);
+      return { ok: false, model: '', latencyMs: 0, error: 'mock 模式不发起真实请求。在 EDA 中配置端点后测试。' };
+    },
+  };
+
+  const realBridge = findRealBridge();
+  const bridge = realBridge || mockBridge;
+  window.__copilotBridge = bridge;
+
+  /* 右上角状态：真桥 + 模型已配置 = 常态不显示；仅未接桥 / 模型未配置时亮 chip */
+  function renderStatus() {
+    const el = $('#status');
+    const text = $('#statusText');
+    el.className = 'status';
+    el.onclick = null;
+    el.title = '';
+    if (!realBridge) {
+      el.classList.add('show', 'warn');
+      text.textContent = '预览模式 · 模拟数据';
+      el.title = '未检测到插件桥接（eda.jlc_cbb_copilot）：当前为浏览器直接预览，模块与回复均为演示数据。在嘉立创EDA中打开面板后自动接入真桥。';
+      return;
+    }
+    let s = null;
+    try { s = bridge.getLlmSettings(); } catch (e) { s = null; }
+    if (s && !(s.baseUrl && s.apiKey && s.model)) {
+      el.classList.add('show', 'warn', 'click');
+      text.textContent = '模型未配置 →';
+      el.title = '尚未配置模型端点（baseUrl / apiKey / model）。点击前往设置。';
+      el.onclick = () => switchTab('settings');
+    }
+  }
+  renderStatus();
+
+  /* ── 亮 / 暗主题：默认跟随系统，按钮手动切换并持久化（扁平线性图标） ── */
+  const THEME_KEY = 'cbb-copilot-theme';
+  function applyTheme(t) {
+    if (t === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+    const moon = document.querySelector('#themeBtn .ico-moon');
+    const sun = document.querySelector('#themeBtn .ico-sun');
+    if (moon && sun) { moon.style.display = t === 'dark' ? 'none' : 'block'; sun.style.display = t === 'dark' ? 'block' : 'none'; }
+  }
+  let curTheme = null;
+  try { curTheme = localStorage.getItem(THEME_KEY); } catch (e) {}
+  if (curTheme !== 'light' && curTheme !== 'dark') curTheme = null;
+  applyTheme(curTheme || (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+  if (window.matchMedia) {
+    try {
+      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ev => {
+        let saved = null;
+        try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+        if (saved !== 'light' && saved !== 'dark') applyTheme(ev.matches ? 'dark' : 'light');
+      });
+    } catch (e) {}
+  }
+  $('#themeBtn').onclick = () => {
+    curTheme = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    applyTheme(curTheme);
+    try { localStorage.setItem(THEME_KEY, curTheme); } catch (e) {}
+  };
+
+  function scrollBottom() { msgList.scrollTop = msgList.scrollHeight; }
+  /* ── 工具行 / 整轮计时组的折叠：事件委托（挂 msgList，实时解析当前 DOM），
+     避免逐元素 onclick 因任何 DOM 重建而悬空失效 ── */
+  msgList.addEventListener('click', e => {
+    const line = e.target.closest('.tool-line');
+    if (!line || !msgList.contains(line)) return;
+    const tool = line.closest('.tool');
+    if (!tool) return;
+    if (tool.classList.contains('work')) {
+      const opening = !tool.classList.contains('open');
+      tool.classList.toggle('open', opening);
+      if (!opening) tool.querySelectorAll('.tool-sub .tool.open').forEach(t => t.classList.remove('open'));
+    } else {
+      const detail = tool.querySelector('.tool-detail');
+      if (detail && detail.textContent) tool.classList.toggle('open');
+    }
+  });
+  function addUserMsg(text) {
+    $('#page-chat').classList.remove('empty'); /* 首条消息后隐藏空会话首屏 */
+    if (!chatTabNamed) { /* 会话标签页名 = 首条用户消息前 8 字（超长加省略号） */
+      chatTabNamed = true;
+      const t = String(text || '').trim().replace(/\s+/g, ' ');
+      if (t) setChatTabTitle(t.length > 8 ? t.slice(0, 8) + '…' : t);
+    }
+    curSeg = null; /* 新用户消息开启新分段 */
+    const seg = ensureSeg();
+    const c = document.createElement('div'); c.className = 'col user';
+    c.innerHTML = `<div class="bubble user">${esc(text)}</div>`;
+    seg.appendChild(c); scrollBottom();
+  }
+  function addNote(text) {
+    const n = document.createElement('div'); n.className = 'sysnote'; n.textContent = text;
+    ensureSeg().appendChild(n); scrollBottom(); return n;
+  }
+  function addAiBubble() {
+    const c = document.createElement('div'); c.className = 'col ai';
+    c.innerHTML = `<div class="ai-body"><span class="txt"></span></div>`;
+    ensureSeg().appendChild(c);
+    return { c, el: c.querySelector('.txt'), text: '' };
+  }
+  /* ── 富文本渲染（Markdown-lite：标题/列表/代码块/行内码/表格/引用/链接）──
+     先整体转义 HTML 再施加标记，模型输出永不以 HTML 注入。 */
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+  function inlineFmt(text) {
+    let t = escHtml(text);
+    t = t.replace(/`([^`\n]+)`/g, (m, c) => `<code class="md-inline">${c}</code>`);
+    t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+    t = t.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<i>$2</i>');
+    t = t.replace(/~~([^~\n]+)~~/g, '<s>$1</s>');
+    t = t.replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return t;
+  }
+  function splitRow(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  }
+  function wrapList(items) {
+    const tag = items[0].ordered ? 'ol' : 'ul';
+    return `<${tag}>${items.map(it => `<li>${inlineFmt(it.text)}</li>`).join('')}</${tag}>`;
+  }
+  function mdBlock(src) {
+    const lines = String(src).split('\n');
+    let html = '';
+    let para = [];
+    let i = 0;
+    const flushPara = () => {
+      if (para.length) html += `<p>${para.map(inlineFmt).join('<br>')}</p>`;
+      para = [];
+    };
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (/^\|.*\|\s*$/.test(line) && i + 1 < lines.length && /^\|[\s:|-]+\|\s*$/.test(lines[i + 1])) {
+        flushPara();
+        const header = splitRow(line);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && /^\|.*\|\s*$/.test(lines[i])) { rows.push(splitRow(lines[i])); i++; }
+        html += `<table class="md-table"><thead><tr>${header.map(c => `<th>${inlineFmt(c)}</th>`).join('')}</tr></thead><tbody>`
+          + rows.map(r => `<tr>${r.map(c => `<td>${inlineFmt(c)}</td>`).join('')}</tr>`).join('') + '</tbody></table>';
+        continue;
+      }
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) { flushPara(); html += '<hr>'; i++; continue; }
+      const h = trimmed.match(/^(#{1,4})\s+(.*)$/);
+      if (h) {
+        flushPara();
+        const lv = Math.min(h[1].length, 3);
+        html += `<h${lv}>${inlineFmt(h[2])}</h${lv}>`;
+        i++; continue;
+      }
+      if (/^>\s?/.test(trimmed)) {
+        flushPara();
+        const q = [];
+        while (i < lines.length && /^>\s?/.test(lines[i].trim())) { q.push(lines[i].trim().replace(/^>\s?/, '')); i++; }
+        html += `<blockquote>${q.map(inlineFmt).join('<br>')}</blockquote>`;
+        continue;
+      }
+      const li = line.match(/^(\s*)([-*]|\d+[.)])\s+(.*)$/);
+      if (li) {
+        flushPara();
+        const items = [];
+        while (i < lines.length) {
+          const m2 = lines[i].match(/^(\s*)([-*]|\d+[.)])\s+(.*)$/);
+          if (!m2) break;
+          items.push({ indent: m2[1].length, ordered: /\d/.test(m2[2]), text: m2[3] });
+          i++;
+        }
+        let idx = 0;
+        while (idx < items.length) {
+          const it = items[idx];
+          if (it.indent >= 2) {
+            const group = [];
+            while (idx < items.length && items[idx].indent >= 2) { group.push(items[idx]); idx++; }
+            html += wrapList(group);
+            continue;
+          }
+          const ordered = it.ordered;
+          const tag = ordered ? 'ol' : 'ul';
+          const rows = [];
+          let inner = `<li>${inlineFmt(it.text)}`;
+          idx++;
+          const kids = [];
+          while (idx < items.length && items[idx].indent >= 2) { kids.push(items[idx]); idx++; }
+          if (kids.length) inner += wrapList(kids);
+          inner += '</li>';
+          rows.push(inner);
+          while (idx < items.length && items[idx].indent < 2 && items[idx].ordered === ordered) {
+            let inner2 = `<li>${inlineFmt(items[idx].text)}`;
+            idx++;
+            const kids2 = [];
+            while (idx < items.length && items[idx].indent >= 2) { kids2.push(items[idx]); idx++; }
+            if (kids2.length) inner2 += wrapList(kids2);
+            inner2 += '</li>';
+            rows.push(inner2);
+          }
+          html += `<${tag}>${rows.join('')}</${tag}>`;
+        }
+        continue;
+      }
+      if (trimmed === '') { flushPara(); i++; continue; }
+      para.push(line);
+      i++;
+    }
+    flushPara();
+    return html;
+  }
+  function mdRich(src) {
+    const parts = String(src).split('```');
+    let html = '';
+    for (let i = 0; i < parts.length; i++) {
+      if (i % 2 === 1) {
+        let code = parts[i];
+        let lang = '';
+        const nl = code.indexOf('\n');
+        if (nl >= 0) {
+          const first = code.slice(0, nl).trim();
+          if (/^[\w.+-]*$/.test(first)) { lang = first; code = code.slice(nl + 1); }
+        }
+        html += `<pre class="md-code"${lang ? ` data-lang="${escHtml(lang)}"` : ''}><code>${escHtml(code.replace(/\n$/, ''))}</code></pre>`;
+      }
+      else {
+        html += mdBlock(parts[i]);
+      }
+    }
+    return html;
+  }
+  async function streamAi(text, speed) {
+    speed = speed || 2;
+    const b = addAiBubble();
+    const caret = document.createElement('span'); caret.className = 'caret';
+    b.el.after(caret);
+    for (let i = 0; i < text.length; i += speed) {
+      b.text += text.slice(i, i + speed);
+      b.el.innerHTML = mdRich(b.text); scrollBottom();
+      await sleep(18);
+    }
+    b.el.innerHTML = mdRich(text); caret.remove(); scrollBottom();
+    return b;
+  }
+  /* 整轮工作计时（从消息发出起算）：运行中「⟳ Working for Xs」（旋转+闪烁），
+     结束「Worked for Xs」；展开显示本轮各工具行，收起时不���示 */
+  function addWorkTimer() {
+    const el = document.createElement('div'); el.className = 'tool work running'; /* 默认收起 */
+    el.innerHTML = `
+      <div class="tool-line">
+        <span class="tool-spin" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M7 1.5A5.5 5.5 0 1 1 1.5 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span>
+        <span class="tool-label"></span>
+        <span class="tool-caret" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      </div>
+      <div class="tool-sub"></div>`;
+    ensureSeg().appendChild(el);
+    const label = el.querySelector('.tool-label');
+    const t0 = Date.now();
+    const elapsed = () => Math.floor((Date.now() - t0) / 1000);
+    label.textContent = `Working for ${elapsed()}s`;
+    const timer = setInterval(() => { label.textContent = `Working for ${elapsed()}s`; }, 1000);
+    return {
+      body: el.querySelector('.tool-sub'),
+      done() {
+        clearInterval(timer);
+        el.classList.remove('running'); el.classList.remove('open'); el.classList.add('ok');
+        label.textContent = `Worked for ${elapsed()}s`;
+      },
+    };
+  }
+  function addToolBubble(name, argsSummary, parentEl) {
+    const el = document.createElement('div'); el.className = 'tool';
+    el.innerHTML = `
+      <div class="tool-line">
+        <span class="tool-label">Running ${esc(name)}</span>
+        <span class="tool-caret" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      </div>
+      <div class="tool-detail"></div>`;
+    (parentEl || ensureSeg()).appendChild(el);
+    const label = el.querySelector('.tool-label');
+    const detail = el.querySelector('.tool-detail');
+    function fill(payload) {
+      const parts = [];
+      if (argsSummary) parts.push(String(argsSummary));
+      if (payload !== undefined) parts.push(typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2));
+      detail.textContent = parts.join('\n');
+    }
+    scrollBottom();
+    if (argsSummary) detail.textContent = String(argsSummary); /* 运行中即可展开看参数 */
+    return {
+      done(detailData) {
+        el.classList.add('ok');
+        label.textContent = `${name} · completed`;
+        fill(detailData);
+        scrollBottom();
+      },
+      fail(err, detailData) {
+        el.classList.add('err');
+        label.textContent = `${name} · failed`;
+        fill((err ? err + '\n' : '') + (detailData !== undefined ? (typeof detailData === 'string' ? detailData : JSON.stringify(detailData, null, 2)) : ''));
+        scrollBottom();
+      },
+      skip(reason) {
+        el.classList.add('skip');
+        label.textContent = `${name} · skipped`;
+        if (reason) fill(reason);
+        scrollBottom();
+      },
+    };
+  }
+  function appendGotoSettings(parent) {
+    const btn = document.createElement('button');
+    btn.className = 'btn link';
+    btn.textContent = '去设置检查 →';
+    btn.onclick = () => switchTab('settings');
+    parent.appendChild(document.createElement('br'));
+    parent.appendChild(btn);
+  }
+  function invalidateCards(reason) {
+    liveCards.forEach(c => {
+      if (!c.classList.contains('done')) {
+        c.classList.add('dead');
+        const ft = c.querySelector('.card-foot');
+        if (ft) ft.insertAdjacentHTML('beforeend', `<span style="color:var(--red);font-size:11.5px;margin-left:auto">⚠ ${esc(reason)}，请重新发起</span>`);
+      }
+    });
+    liveCards.length = 0;
+  }
+  function markCardsRisk() {
+    liveCards.forEach(c => { if (!c.classList.contains('done') && !c.classList.contains('dead')) c.classList.add('risk'); });
+  }
+
+  /* ── 统一卡壳（Claude/Cursor 式问答框弹窗卡）：卡头可折叠，正文 + 可选详情 + 右下操作区 ──
+     title 卡标题；bodyHTML 正文；detailText 折叠区纯文本（JSON/原因，可省略）；
+     footHTML 操作按钮（含 .spacer 用于右对齐）。返回卡元素。 */
+  function cardShell({ title, bodyHTML, detailText, footHTML }) {
+    const el = document.createElement('div'); el.className = 'card open';
+    el.innerHTML = `
+      <div class="card-hd">
+        <span>${esc(title)}</span>
+        <span class="hd-status"></span>
+        <span class="caret-box" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      </div>
+      <div class="card-bd">${bodyHTML}</div>
+      ${detailText ? `<div class="card-detail">${esc(detailText)}</div>` : ''}
+      <div class="card-foot">${footHTML}</div>`;
+    el.querySelector('.card-hd').onclick = () => el.classList.toggle('open');
+    ensureSeg().appendChild(el); liveCards.push(el); scrollBottom();
+    return el;
+  }
+
+  function addPlaceCard(card) {
+    const picks = card.picks || [];
+    const items = picks.map((p, i) => `
+      <div class="pick-item">
+        <input type="checkbox" class="pk-check" data-i="${i}" checked>
+        <div class="pi-main">
+          <div class="pi-title">${esc(p.name)} <span class="pick-src">${esc(p.src)}</span></div>
+          ${p.reason ? `<span class="pi-reason">${esc(p.reason)}</span>` : ''}
+        </div>
+        <div class="pi-ctrls">
+          <select class="pk-mode" ${p.pageSupport ? '' : 'disabled title="本地库不支持复用模块图页（lib_Cbb.get 崩溃）"'}>
+            <option value="page" ${p.mode === 'page' && p.pageSupport ? 'selected' : ''}>复用模块图页</option>
+            <option value="symbol" ${p.mode !== 'page' ? 'selected' : ''}>复用模块符号</option>
+          </select>
+          <select class="pk-target">
+            <option value="current" ${p.target === 'current' || !p.target ? 'selected' : ''}>当前图页</option>
+            <option value="new" ${p.target === 'new' ? 'selected' : ''}>新建图页</option>
+            <option value="board" ${p.target === 'board' ? 'selected' : ''}>新建板子</option>
+            <option value="project" ${p.target === 'project' ? 'selected' : ''}>新建工程</option>
+          </select>
+        </div>
+      </div>`).join('');
+    const notes = [];
+    if ((card.filtered || []).length) notes.push(`已过滤无效候选：${card.filtered.join('、')}`);
+    if (card.notFoundHint) notes.push(card.notFoundHint);
+    notes.push('自动按对齐网格排布并避开已占用区域；每次放置会向工程库写入一个 CBB 副本。');
+    const el = cardShell({
+      title: '放置方案确认',
+      bodyHTML: items + (picks.length > 1 ? `<div class="hint">共 ${picks.length} 项，可逐项调整形式与位置。</div>` : ''),
+      detailText: notes.join('\n'),
+      footHTML: `<button class="btn primary act-place">放置所选</button><span class="spacer"></span><button class="btn act-cancel">取消</button>`,
+    });
+    el.querySelector('.act-cancel').onclick = () => {
+      el.classList.add('dead');
+      liveCards.splice(liveCards.indexOf(el), 1);
+      try { bridge.cancelCard(SESSION_ID, card.token); } catch (e) {}
+      addNote('已取消放置');
+      streamAi('好的，已取消。需要我换一批候选吗？', 3);
+    };
+    el.querySelector('.act-place').onclick = async () => {
+      if (busy) return; busy = true;
+      const items = [];
+      el.querySelectorAll('.pk-check').forEach(cb => {
+        if (!cb.checked) return;
+        const item = cb.closest('.pick-item');
+        const i = +cb.dataset.i; const p = picks[i];
+        items.push({
+          libraryUuid: p.libraryUuid, cbbUuid: p.uuid, name: p.name,
+          mode: item.querySelector('.pk-mode').value,
+          target: item.querySelector('.pk-target').value,
+        });
+      });
+      if (!items.length) { busy = false; addNote('未勾选任何模块'); return; }
+      el.classList.add('done'); liveCards.splice(liveCards.indexOf(el), 1);
+      const tb = addToolBubble('place_cbb', items.length + ' 项');
+      try {
+        const res = await bridge.confirmPlace(SESSION_ID, card.token, items);
+        const okCnt = (res.results || []).filter(r => r.ok).length;
+        okCnt === (res.results || []).length ? tb.done(res) : tb.fail(((res.results || []).length - okCnt) + ' 项失败', res);
+        busy = false;
+        const pages = (res.results || []).filter(r => r.ok && r.pageName).map(r => r.pageName);
+        const pageHint = pages.length ? `落在图页 ${[...new Set(pages)].map(n => '**' + n + '**').join('、')}。` : '';
+        const fbCnt = (res.results || []).filter(r => r.ok && r.fallbackFromSymbol).length;
+        const fbHint = fbCnt ? `\n⚠ 其中 ${fbCnt} 项因**模块未生成符号**（空符号）自动改为图页形式。` : '';
+        await streamAi(`已完成 **${okCnt}/${(res.results || []).length}** 项放置（均已标注框+标题）。${pageHint}${fbHint}工程库中会各留一个 CBB 副本。`, 3);
+      } catch (e) {
+        tb.fail(e.message || String(e));
+        busy = false;
+        await streamAi(e.message || '放置失败', 3);
+      }
+    };
+  }
+
+  function addEditCard(card) {
+    const el = cardShell({
+      title: '模块描述编辑',
+      bodyHTML: `
+        <div class="pick-item" style="display:block">
+          <div class="pi-title">${esc(card.origName || card.name)} <span class="pick-src">${esc(card.src)}</span></div>
+          ${card.analyzed ? '<span class="pi-reason" style="color:var(--blue)">已按模块自带原理图自动分析生成建议，可直接修改。</span>' : ''}
+          <label style="display:block; font-size:11.5px; color:var(--text-3); margin:9px 0 3px;">更新模块名称</label>
+          <input type="text" class="em-name" value="${esc(card.name)}" style="width:100%; padding:6px 9px; border:1px solid var(--line); border-radius:7px; font:12.5px/1.5 inherit; font-family:inherit; background:var(--panel); color:var(--text); outline:none;">
+          <label style="display:block; font-size:11.5px; color:var(--text-3); margin:8px 0 3px;">更新模块描述</label>
+          <textarea class="em-desc" style="width:100%; min-height:84px; resize:vertical; padding:6px 9px; border:1px solid var(--line); border-radius:7px; font:12.5px/1.5 inherit; font-family:inherit; background:var(--panel); color:var(--text); outline:none;">${esc(card.description || '')}</textarea>
+        </div>`,
+      footHTML: `<button class="btn primary act-apply">写回修改</button><span class="spacer"></span><button class="btn act-cancel">取消</button>`,
+    });
+    el.querySelector('.act-cancel').onclick = () => {
+      el.classList.add('dead'); liveCards.splice(liveCards.indexOf(el), 1);
+      try { bridge.cancelCard(SESSION_ID, card.token); } catch (e) {}
+      addNote('已取消编辑');
+    };
+    el.querySelector('.act-apply').onclick = async () => {
+      if (busy) return; busy = true;
+      el.classList.add('done'); liveCards.splice(liveCards.indexOf(el), 1);
+      const payload = {
+        libraryUuid: card.libraryUuid, cbbUuid: card.cbbUuid,
+        name: el.querySelector('.em-name').value, description: el.querySelector('.em-desc').value,
+      };
+      const tb = addToolBubble('edit_module', payload.name);
+      try {
+        const res = await bridge.confirmEdit(SESSION_ID, card.token, payload);
+        res.ok ? tb.done(res) : tb.fail(res.error || '失败', res);
+        busy = false;
+        await streamAi(res.ok ? '已写回修改。到官方库面板刷新后即可看到。' : ('写回失败：' + (res.error || '')), 3);
+      } catch (e) {
+        tb.fail(e.message || String(e)); busy = false;
+      }
+    };
+  }
+
+  function addExportCard(card) {
+    const stats = card.stats || {};
+    const picks = card.picks || [];
+    const items = picks.map((p, i) => `
+      <div class="pick-item">
+        <input type="checkbox" class="ep-check" data-i="${i}" checked>
+        <div class="pi-main">
+          <div class="pi-title">${esc(p.name)} <span class="pick-src">${esc(p.src)}</span></div>
+          <span class="pi-reason">${p.hasFile ? '本地 · 含工程文件' : (p.storage === 'local' ? '本地 · 路径未解析' : '云端 · 仅清单')}</span>
+        </div>
+      </div>`).join('');
+    const statParts = [];
+    if (stats.modules) statParts.push(`${stats.modules} 模块`);
+    if (stats.libraries) statParts.push(`${stats.libraries} 库`);
+    if (stats.emptyDesc) statParts.push(`${stats.emptyDesc} 描述为空`);
+    if (stats.failed) statParts.push(`${stats.failed} 库拉取失败`);
+    const el = cardShell({
+      title: '工程包导出确认',
+      bodyHTML: items + `<div class="hint">未勾选的模块不会写入 zip（catalog.json 同步排除）。云端模块勾选仅表示保留清单条目，工程数据在服务器。不含 apiKey。</div>`,
+      detailText: statParts.length ? `目录统计：${statParts.join(' · ')}${stats.elapsedMs ? ` · 耗时 ${(stats.elapsedMs / 1000).toFixed(1)}s` : ''}` : undefined,
+      footHTML: `<button class="btn primary act-go">导出工程包 zip</button><span class="spacer"></span><button class="btn act-cancel">取消</button>`,
+    });
+    ensureSeg().appendChild(el); liveCards.push(el); scrollBottom();
+    el.querySelector('.act-cancel').onclick = () => {
+      el.classList.add('dead'); liveCards.splice(liveCards.indexOf(el), 1);
+      try { bridge.cancelCard(SESSION_ID, card.token); } catch (e) {}
+      addNote('已取消导出');
+    };
+    el.querySelector('.act-go').onclick = async () => {
+      if (busy) return; busy = true;
+      el.classList.add('done'); liveCards.splice(liveCards.indexOf(el), 1);
+      const tb = addToolBubble('export_catalog', (stats.modules || 0) + ' 模块');
+      try {
+        const uuids = [];
+        el.querySelectorAll('.ep-check').forEach(cb => { if (cb.checked) uuids.push((card.picks || [])[+cb.dataset.i].uuid); });
+        if (!uuids.length) { el.classList.remove('done'); busy = false; addNote('未勾选任何模块'); return; }
+        const res = await bridge.confirmExport(SESSION_ID, card.token, uuids);
+        if (res.ok) {
+          tb.done(res); busy = false;
+          await streamAi(`工程包 **${res.fileName}** 已通过另存对话框写出：打包本地模块工程文件 **${res.fileCount ?? 0}** 个，云端模块 ${res.cloudCount ?? 0} 个仅清单留痕（zip 内含 catalog.json）。`, 3);
+        }
+        else { tb.skip(res.error || '已取消'); busy = false; if (res.error !== '已取消') await streamAi('导出失败：' + res.error, 3); }
+      } catch (e) {
+        tb.fail(e.message || String(e)); busy = false;
+      }
+    };
+  }
+
+  function renderCards(cards) {
+    (cards || []).forEach(c => {
+      if (c.type === 'place') addPlaceCard(c);
+      else if (c.type === 'edit') addEditCard(c);
+      else if (c.type === 'export') addExportCard(c);
+    });
+  }
+  function renderTools(tools, body) {
+    (tools || []).forEach(t => {
+      const tb = addToolBubble(t.name, t.argsSummary || '', body);
+      if (t.status === 'ok') tb.done(t.detail);
+      else if (t.status === 'skip') tb.skip(t.error);
+      else tb.fail(t.error || '失败', t.detail);
+    });
+  }
+
+  async function handleUser(text) {
+    const t = String(text || '').trim();
+    if (!t || busy) return;
+    busy = true;
+    syncSendState();
+    addUserMsg(t);
+    markCardsRisk();
+    const work = addWorkTimer(); /* 整轮计时：从消息发出起算 */
+    try {
+      const res = await bridge.chatTurn(SESSION_ID, t);
+      if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
+        invalidateCards('目录已更新');
+      renderTools(res.tools, work.body);
+      const b = await streamAi(res.assistantText || '', 3);
+      if (res.gotoSettings || (res.error && res.error.gotoSettings))
+        appendGotoSettings(b.el.parentElement);
+      renderCards(res.cards);
+    } catch (e) {
+      addNote('会话出现异常：' + (e.message || e));
+    }
+    busy = false;
+    syncSendState();
+    work.done();
+  }
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.page === name));
+    $('#page-chat').classList.toggle('on', name === 'chat');
+    $('#page-settings').classList.toggle('on', name === 'settings');
+    const gear = $('#settingsBtn');
+    if (gear) gear.classList.toggle('on', name === 'settings');
+  }
+  document.querySelectorAll('.tab').forEach(t => t.onclick = () => switchTab(t.dataset.page));
+  $('#settingsBtn').onclick = () => switchTab(
+    $('#page-settings').classList.contains('on') ? 'chat' : 'settings');
+
+  const CHIP_PROMPTS = ['现在有哪些模块？', '找一个电源模块并放置', '帮我把模块描述写规范', '导出复用模块工程和索引json'];
+  CHIP_PROMPTS.forEach(c => { /* 空会话首屏（#chips，居中换行）与对话中建议条（#chipsBar，横滑）共用同一组选项 */
+    const b = document.createElement('div'); b.className = 'chip'; b.textContent = c;
+    b.onclick = () => handleUser(c);
+    $('#chips').appendChild(b);
+    $('#chipsBar').appendChild(b.cloneNode(true));
+  });
+  /* 建议条滚轮横滑：滚轮增量优先横向滚动本栏（始终精确到 0 / max，不会截断），
+     超出部分转交上方消息区，避免边缘死区与对话流误滚 */
+  $('#chipsBar').addEventListener('wheel', e => {
+    const el = e.currentTarget;
+    const max = el.scrollWidth - el.clientWidth;
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (max <= 0) { msgList.scrollTop += delta; return; }
+    e.preventDefault();
+    const clamped = Math.max(0, Math.min(max, el.scrollLeft + delta));
+    const consumed = clamped - el.scrollLeft;
+    el.scrollLeft = clamped;
+    const leftover = delta - consumed;
+    if (Math.abs(leftover) > 0.5) msgList.scrollTop += leftover;
+  }, { passive: false });
+
+  const input = $('#input');
+  const sendBtn = $('#send');
+  function autosize() {
+    input.style.height = 'auto';
+    /* scrollHeight 已含上下 padding（20px 行高 + 20px padding = 空闲单行 40px） */
+    input.style.height = Math.min(input.scrollHeight, 132) + 'px';
+  }
+  function syncSendState() {
+    sendBtn.disabled = busy || !input.value.trim();
+  }
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      if (!sendBtn.disabled) { handleUser(input.value); input.value = ''; autosize(); syncSendState(); }
+    }
+  });
+  input.addEventListener('input', () => { autosize(); syncSendState(); });
+  sendBtn.onclick = () => { if (!sendBtn.disabled) { handleUser(input.value); input.value = ''; autosize(); syncSendState(); } };
+  syncSendState();
+
+  $('#toggleKey').onclick = () => {
+    const k = $('#setKey');
+    k.type = k.type === 'password' ? 'text' : 'password';
+    $('#toggleKey').textContent = k.type === 'password' ? '显示' : '隐藏';
+  };
+  function loadSettingsIntoForm() {
+    try {
+      const s = bridge.getLlmSettings();
+      if (s) {
+        $('#setFormat').value = s.provider || 'openai-chat';
+        $('#setBase').value = s.baseUrl || '';
+        $('#setKey').value = s.apiKey || '';
+        $('#setModel').value = s.model || '';
+      }
+    } catch (e) {}
+    try {
+      const ps = typeof bridge.getPlacementSettings === 'function' ? bridge.getPlacementSettings() : null;
+      if (ps) {
+        $('#setGapX').value = ps.gapX || 80;
+        $('#setGapY').value = ps.gapY || 80;
+        $('#setBorderColor').value = ps.borderColor || '';
+        $('#setBorderWidth').value = ps.borderWidth || '';
+        $('#setMargin').value = (ps.margin === 0 || ps.margin) ? ps.margin : 40;
+      }
+    } catch (e) {}
+  }
+  loadSettingsIntoForm();
+
+  /* ── 客户端模式检测（初始时）：三源直测结果驱动库范围只读展示 ── */
+  const MODE_LABELS = { online: '在线版', 'half-offline': '半离线版', offline: '全离线版', unknown: '模式未判定' };
+  async function applyClientEnv() {
+    if (typeof bridge.getClientEnv !== 'function') return;
+    const line = $('#envLine');
+    const scopeList = $('#scopeList');
+    try {
+      const env = await bridge.getClientEnv();
+      /* 只展示可用的库；不可用的库提示切换客户端模式 */
+      const avail = [];
+      const unavail = [];
+      if (env.personalAvailable !== false) avail.push('个人库'); else unavail.push('个人库');
+      if (env.teamAvailable !== false) avail.push('团队库'); else unavail.push('团队库');
+      if (env.localAvailable) avail.push('本地库'); else unavail.push('本地库');
+      const switchHint = unavail.length
+        ? (env.mode === 'online'
+            ? `如需使用${unavail.join('、')}，请切换到半离线 / 全离线客户端`
+            : `如需使用${unavail.join('、')}，请切换到在线版客户端`)
+        : '';
+      if (line) {
+        line.hidden = false;
+        line.innerHTML = `🧭 <b>${esc(MODE_LABELS[env.mode] || env.mode)}</b>：${esc(avail.join('、'))}可用。${esc(switchHint)}`;
+        if (unavail.length) line.classList.add('warn');
+      }
+      if (scopeList) {
+        const rows = [
+          ['个人库（云端）', env.personalAvailable !== false],
+          ['团队库（云端）', env.teamAvailable !== false],
+          ['本地库（离线 / 半离线）', env.localAvailable],
+        ];
+        scopeList.innerHTML = rows.map(([n, ok]) =>
+          `<div class="scoperow"><b>${esc(n)}</b><span class="scope-badge ${ok ? 'ok' : 'bad'}">${ok ? '可用' : '不可达'}</span></div>`).join('');
+      }
+    }
+    catch (e) {
+      if (scopeList) scopeList.innerHTML = '<div class="scoperow"><b>检测结果不可用</b><span class="scope-badge bad">各源按失败隔离尝试拉取</span></div>';
+    }
+  }
+  applyClientEnv();
+
+  $('#saveSettings').onclick = () => {
+    try {
+      bridge.saveLlmSettings({ provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value });
+      if (typeof bridge.savePlacementSettings === 'function') {
+        const hex = v => (/^#[0-9a-fA-F]{6}$/.test(String(v).trim()) ? String(v).trim() : '');
+        const num = (v, min) => (Number.isFinite(+v) && +v > (min || 0) ? +v : null);
+        bridge.savePlacementSettings({
+          gapX: +$('#setGapX').value > 0 ? +$('#setGapX').value : 80,
+          gapY: +$('#setGapY').value > 0 ? +$('#setGapY').value : 80,
+          borderColor: hex($('#setBorderColor').value),
+          borderWidth: num($('#setBorderWidth').value, 0),
+          margin: Number.isFinite(+$('#setMargin').value) && +$('#setMargin').value >= 0 ? +$('#setMargin').value : 40,
+        });
+      }
+      renderStatus();
+      const r = $('#connResult'); r.className = 'opresult ok'; r.textContent = '✅ 设置已保存（双写）。放置排布设置下次放置生效。';
+    } catch (e) {
+      const r = $('#connResult'); r.className = 'opresult err'; r.textContent = '保存失败：' + e.message;
+    }
+  };
+  $('#testConn').onclick = async () => {
+    const r = $('#connResult'); r.className = '';
+    const btn = $('#testConn'); btn.disabled = true; btn.textContent = '测试中…';
+    try {
+      const res = await bridge.testConnection();
+      r.className = res.ok ? 'opresult ok' : 'opresult err';
+      r.textContent = res.ok ? `✅ 连接成功：${res.model} · ${res.latencyMs}ms` : `❌ ${res.error}`;
+    } catch (e) {
+      r.className = 'opresult err'; r.textContent = '❌ ' + e.message;
+    }
+    btn.disabled = false; btn.textContent = '测试连接';
+  };
+  const pkgOut = () => { const o = $('#pkgOut'); o.style.display = 'block'; return o; };
+  $('#btnImportPkg').onclick = async () => {
+    const out = pkgOut(); out.textContent = '请选择工程包 zip…';
+    try {
+      const r = await bridge.importProjectPackage();
+      if (r && r.note === '未选择文件') { out.textContent = '已取消导入。'; return; }
+      const lines = [`目标目录：${r.targetDir}`, `导入成功 ${r.imported.length} 个：${r.imported.join('、') || '（无）'}`];
+      if (r.failed && r.failed.length) lines.push(`失败 ${r.failed.length} 项：` + r.failed.map(f => `\n  · ${f.file}：${f.error}`).join(''));
+      if (r.error) lines.push(`错误：${r.error}`);
+      if (r.note) lines.push(r.note);
+      out.textContent = (r.ok ? '✅ ' : '⚠ ') + lines.join('\n');
+    } catch (e) { out.textContent = '❌ 导入失败：' + (e.message || String(e)); }
+  };
+  /* ── 会话标签页：名称默认「复用模块助手」，首条用户消息后更名；× 关闭 = 新会话 ── */
+  const TAB_DEFAULT_TITLE = '复用模块助手';
+  const chatTabLabel = $('#chatTabLabel');
+  let chatTabNamed = false;
+  const setChatTabTitle = (t) => { chatTabLabel.textContent = t; $('#chatTab').title = t; };
+  function resetChat() {
+    if (!confirm('清空当前对话与目录快照？（设置不受影响）')) return;
+    try { bridge.resetChatSession(SESSION_ID); } catch (e) {}
+    msgList.innerHTML = ''; liveCards.length = 0; curSeg = null;
+    chatTabNamed = false; setChatTabTitle(TAB_DEFAULT_TITLE);
+    $('#page-chat').classList.add('empty'); /* 恢复空会话首屏 */
+    switchTab('chat');
+  }
+  $('#clearChatBtn').onclick = resetChat;
+  $('#chatTabClose').onclick = (e) => { e.stopPropagation(); resetChat(); };
+})();
+</script>
+</body>
+</html>
