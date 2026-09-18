@@ -6,8 +6,8 @@
 import type { CatalogJson, CatalogStatsView } from '../catalog';
 import type { CachedGeometry, PlaceBox, PlaceMode, PlaceTarget, RegionStyle } from '../cbb';
 import type { HistoryTurn } from './llm';
-import type { AgentToolName } from './tools';
 import type { CatalogStoreRecord, FlatModule } from './store';
+import type { AgentToolName } from './tools';
 import { fetchCatalog } from '../catalog';
 import { activateSchematicPage, cacheGeometry, collectPageObstacles, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary } from '../cbb';
 import { effectiveLibraryScope, runSelfCheck } from '../env';
@@ -15,14 +15,18 @@ import { exportProjectPackage } from '../pkg';
 import { getLlmSettings, getPlacementSettings } from '../settings';
 import { classifyLlmError, registerAbort, releaseAbort, sendLlmRequest, STREAM_SENTINEL } from './http';
 import { buildAgentRequest, buildPingRequest, parseAgentResponse, StreamAccumulator } from './llm';
+import { buildCatalogSummaryPayload, clearCatalogRecord, EMPTY_CATALOG_NOTE, flattenCatalog, humanizeAge, loadCatalogRecord, lookupModule, searchInCatalog, storeCatalog } from './store';
 import { AGENT_TOOL_NAMES, MAX_DESC_LEN } from './tools';
-import { buildCatalogSummaryPayload, clearCatalogRecord, EMPTY_CATALOG_NOTE, flattenCatalog, humanizeAge, loadCatalogRecord, lookupModule, memoryRecordIfLoaded, searchInCatalog, storeCatalog } from './store';
 
 /** 单条消息最多发起的模型调用轮数（每轮 = 思考 + 可选工具执行；工具结果驱动下一轮）。 */
 const MAX_AGENT_ROUNDS = 12;
 /** 单轮对话工具调用总量上限（Round ≠ Tool Call：模型一轮可返回多个调用，需独立限制防异常循环）。 */
-const MAX_TOOL_CALLS = 24;
+const MAX_TOOL_CALLS = 48;
 const MAX_HISTORY = 12;
+/** compact_history 保留的最近用户轮次：折叠只影响更早的历史（trimHistory 的 12 轮硬兜底不变）。 */
+const COMPACT_KEEP_TURNS = 4;
+/** 注入轮数信号的阈值：超过该值时每轮提示建议调用 compact_history。 */
+const COMPACT_SUGGEST_TURNS = 8;
 /** propose_placement 单卡最大候选数（与 schema maxItems 一致；网格批量放置的上限）。 */
 const MAX_PLACEMENT_PICKS = 20;
 
@@ -531,6 +535,42 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			result: { ok: true, token, picks: picks.map(p => p.name), filtered, hint: '已出示放置确认卡，等待用户确认后才会改动画布' },
 		};
 	},
+	compact_history: async (s, args) => {
+		const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+		if (!summary) {
+			return {
+				event: { name: 'compact_history', argsSummary: '摘要为空', status: 'err', error: '缺少 summary' },
+				result: { ok: false, error: 'summary 不能为空：把此前对话的完整摘要（用户的要求与约束、已完成/进行中的事项、已达成的决定）写入 summary 后重试。' },
+			};
+		}
+		const users = s.history.filter(h => h.role === 'user').length;
+		if (users <= COMPACT_KEEP_TURNS) {
+			return {
+				event: { name: 'compact_history', argsSummary: '历史较短', status: 'skip' },
+				result: { ok: true, compacted: false, hint: `当前仅 ${users} 轮对话，无需折叠。` },
+			};
+		}
+		// 保留窗口起点：倒数第 COMPACT_KEEP_TURNS 个用户消息处；其后内容（含工具流量与进行中的本轮）原样保留。
+		let seen = 0;
+		let idx = 0;
+		for (let i = s.history.length - 1; i >= 0; i--) {
+			if (s.history[i].role === 'user') {
+				seen++;
+				if (seen === COMPACT_KEEP_TURNS) {
+					idx = i;
+					break;
+				}
+			}
+		}
+		const dropped = users - COMPACT_KEEP_TURNS;
+		// 摘要以用户轮占位（与 trimHistory 的折叠存根同构）：摘要由调用模型在参数里自带，
+		// 此刻完整历史仍在该模型上下文中，它自己就是摘要器——不发起额外 LLM 请求。
+		s.history = [{ role: 'user', content: `[对话摘要] ${summary}` }, ...s.history.slice(idx)];
+		return {
+			event: { name: 'compact_history', argsSummary: `折叠 ${dropped} 轮`, status: 'ok' },
+			result: { ok: true, compacted: true, droppedTurns: dropped, hint: '已折叠早期对话，最近几轮原样保留；基于摘要与保留轮次继续当前任务。' },
+		};
+	},
 };
 
 function isAgentToolName(name: string): name is AgentToolName {
@@ -605,10 +645,16 @@ export async function chatTurn(
 			// 每轮重建目录摘要注入：refresh_catalog 落盘后旧摘要必须作废，
 			// 否则同轮上下文里是旧统计、observation 是新统计，模型会被两份数据打架。
 			// 摘要仅含统计 + 各库计数 + 新鲜度（几百 token）；模块明细走 search_modules/get_module。
-			const catalogRecord = memoryRecordIfLoaded();
+			// loadCatalogRecord 读内存缓存 → sys_Storage（唯一持久层）：扩展重启后内存层为空，
+			// 首轮经此从落盘缓存回填——持久化缓存有效时注入真实摘要而非"缓存为空"，
+			// 避免模型每次重启都盲目 refresh_catalog 重拉全量（约 20 秒）；refresh 落盘后内存层已更新，仍即时生效。
+			const catalogRecord = await loadCatalogRecord();
+			const userTurns = s.history.filter(h => h.role === 'user').length;
+			// 轮数信号：模型无法自数轮数，注入确定性计数；超过阈值时明确建议压缩（compact_history）。
+			const historyNote = `\n\n当前对话 ${userTurns} 轮${userTurns > COMPACT_SUGGEST_TURNS ? '，建议调用 compact_history 折叠早期对话（把此前对话的完整摘要写入 summary 参数）' : ''}。`;
 			const catalogNote = catalogRecord
-				? `\n\n目录缓存摘要（模块明细不在上下文中，检索用 search_modules）：\n${buildCatalogSummaryPayload(catalogRecord)}`
-				: `\n\n${EMPTY_CATALOG_NOTE}`;
+				? `\n\n目录缓存摘要（模块明细不在上下文中，检索用 search_modules）：\n${buildCatalogSummaryPayload(catalogRecord)}${historyNote}`
+				: `\n\n${EMPTY_CATALOG_NOTE}${historyNote}`;
 			const settings = getLlmSettings();
 			const req = buildAgentRequest(settings, catalogNote, s.history);
 			req.stream = true;
@@ -769,6 +815,8 @@ function summarizeToolArgs(name: string, args: Record<string, unknown>): string 
 			return Array.isArray(args.picks) ? `${args.picks.length} 个候选` : '候选';
 		case 'propose_export':
 			return '导出确认卡';
+		case 'compact_history':
+			return '折叠早期对话';
 		default:
 			return '';
 	}

@@ -1,9 +1,11 @@
 /**
  * 目录持久化存储（插件级，跨会话/跨重启）。
- * 三级降级适配器：sys_Storage →（API 缺失/抛错）IndexedDB →（都不可用）会话内存。
- * 两端同代码路径：桌面端与网页版 sys_Storage 均已实测持久化（2026-09-18 网页版真机跨重启验证），
- * IndexedDB 仅为防御性兜底（某版本 API 缺失或抛错时自动降级）。
- * 功能探测只做一次并缓存结果；任何一层失败静默降级，不阻塞主流程。
+ * 单持久层：sys_Storage 是 EasyEDA 官方扩展存储，主进程与 iframe 通用，
+ * 桌面端与网页版均已实测跨重启持久化（2026-09-18 网页版真机验证）。
+ * 无第二后端、无静默降级：写路径 await 官方 Promise<boolean>，失败向上抛，
+ * 由 refresh_catalog 的工具错误通道把「目录已拉取但落盘失败，仅本次会话可用」
+ * 显式上报给模型与用户；删除路径尽力而为（残留记录会在下次落盘时被整体覆盖，仅记日志）。
+ * 内存层是会话内缓存（agent 每轮注入目录摘要都要读），不是兜底：落盘失败时保证本会话仍可用。
  *
  * 目录检索：search_modules 关键词评分 + get_module 单模块详情，替代整包注入 LLM。
  */
@@ -36,17 +38,20 @@ export type FlatModule = CatalogModule & {
 	pageSupport: boolean;
 };
 
-// ── 三级适配器：内存（永远可用） ─────────────────────────────────────
+// ── 内存缓存（会话内；非持久层） ─────────────────────────────────────
 
 let memoryRecord: CatalogStoreRecord | null = null;
 
-// ── 一级：sys_Storage ────────────────────────────────────────────────
+// ── 持久层：sys_Storage（唯一持久化后端） ────────────────────────────
 
-type SysStorageApi = {
-	getExtensionUserConfig?: (k: string) => string;
-	setExtensionUserConfig?: (k: string, v: string) => void;
-	deleteExtensionUserConfig?: (k: string) => void;
-};
+interface SysStorageApi {
+	/** 官方签名：同步返回任意值，key 不存在返回 undefined（非 Promise）。 */
+	getExtensionUserConfig?: (k: string) => unknown;
+	/** 官方签名：Promise<boolean>，成败需 await 后才知道。 */
+	setExtensionUserConfig?: (k: string, v: string) => Promise<boolean>;
+	/** 官方签名：Promise<boolean>，成败需 await 后才知道。 */
+	deleteExtensionUserConfig?: (k: string) => Promise<boolean>;
+}
 
 function sysStorage(): SysStorageApi | undefined {
 	try {
@@ -57,145 +62,44 @@ function sysStorage(): SysStorageApi | undefined {
 	}
 }
 
-let sysStorageAvailable: boolean | null = null;
-
+/** 同步读：API 缺失/抛错/非字符串返回一律视为缺失，交由上层走空缓存流程。 */
 function sysGet(key: string): string {
 	const api = sysStorage();
-	if (typeof api?.getExtensionUserConfig !== 'function') {
-		sysStorageAvailable = false;
+	if (typeof api?.getExtensionUserConfig !== 'function')
 		return '';
-	}
 	try {
 		const v = api.getExtensionUserConfig(key);
-		sysStorageAvailable = true;
 		return typeof v === 'string' ? v : '';
 	}
 	catch {
-		sysStorageAvailable = false;
 		return '';
 	}
 }
 
-function sysSet(key: string, val: string): boolean {
+/**
+ * 异步写：同步抛错、Promise 拒绝、返回 false 都视为失败并抛出。
+ * 调用方（saveCatalogRecord）负责补充业务上下文后继续上抛。
+ */
+async function sysSet(key: string, val: string): Promise<void> {
 	const api = sysStorage();
-	if (typeof api?.setExtensionUserConfig !== 'function') {
-		sysStorageAvailable = false;
-		return false;
-	}
-	try {
-		api.setExtensionUserConfig(key, val);
-		sysStorageAvailable = true;
-		return true;
-	}
-	catch {
-		sysStorageAvailable = false;
-		return false;
-	}
+	if (typeof api?.setExtensionUserConfig !== 'function')
+		throw new Error('宿主未注入 sys_Storage.setExtensionUserConfig');
+	const ok = await api.setExtensionUserConfig(key, val);
+	if (ok === false)
+		throw new Error(`sys_Storage 写入返回失败（key=${key}，可能超出存储限额）`);
 }
 
-function sysDelete(key: string): void {
+/** 异步删：失败抛出，由 clearCatalogRecord 决定降级策略（尽力而为 + 日志）。 */
+async function sysDelete(key: string): Promise<void> {
 	const api = sysStorage();
 	if (typeof api?.deleteExtensionUserConfig !== 'function')
-		return;
-	try {
-		api.deleteExtensionUserConfig(key);
-	}
-	catch { /* 尽力而为 */ }
+		throw new Error('宿主未注入 sys_Storage.deleteExtensionUserConfig');
+	const ok = await api.deleteExtensionUserConfig(key);
+	if (ok === false)
+		throw new Error(`sys_Storage 删除返回失败（key=${key}）`);
 }
 
-// ── 二级：IndexedDB（iframe 可用的标准浏览器存储；主进程缺失时静默跳过） ──
-
-const IDB_NAME = 'jlc-cbb-copilot';
-const IDB_STORE = 'kv';
-const IDB_VERSION = 1;
-
-let idbDb: IDBDatabase | null = null;
-let idbBroken = false;
-
-function idbOpen(): Promise<IDBDatabase | null> {
-	if (idbDb)
-		return Promise.resolve(idbDb);
-	if (idbBroken || typeof indexedDB === 'undefined' || indexedDB === null) {
-		idbBroken = true;
-		return Promise.resolve(null);
-	}
-	return new Promise((resolve) => {
-		try {
-			const req = indexedDB.open(IDB_NAME, IDB_VERSION);
-			req.onupgradeneeded = () => {
-				if (!req.result.objectStoreNames.contains(IDB_STORE))
-					req.result.createObjectStore(IDB_STORE);
-			};
-			req.onsuccess = () => {
-				idbDb = req.result;
-				resolve(idbDb);
-			};
-			req.onerror = () => {
-				idbBroken = true;
-				resolve(null);
-			};
-		}
-		catch {
-			idbBroken = true;
-			resolve(null);
-		}
-	});
-}
-
-async function idbGet(key: string): Promise<string> {
-	const db = await idbOpen();
-	if (!db)
-		return '';
-	return new Promise((resolve) => {
-		try {
-			const tx = db.transaction(IDB_STORE, 'readonly');
-			const req = tx.objectStore(IDB_STORE).get(key);
-			req.onsuccess = () => resolve(typeof req.result === 'string' ? req.result : '');
-			req.onerror = () => resolve('');
-		}
-		catch {
-			resolve('');
-		}
-	});
-}
-
-async function idbSet(key: string, val: string): Promise<boolean> {
-	const db = await idbOpen();
-	if (!db)
-		return false;
-	return new Promise((resolve) => {
-		try {
-			const tx = db.transaction(IDB_STORE, 'readwrite');
-			tx.objectStore(IDB_STORE).put(val, key);
-			tx.oncomplete = () => resolve(true);
-			tx.onerror = () => resolve(false);
-			tx.onabort = () => resolve(false);
-		}
-		catch {
-			resolve(false);
-		}
-	});
-}
-
-async function idbDelete(key: string): Promise<void> {
-	const db = await idbOpen();
-	if (!db)
-		return;
-	return new Promise((resolve) => {
-		try {
-			const tx = db.transaction(IDB_STORE, 'readwrite');
-			tx.objectStore(IDB_STORE).delete(key);
-			tx.oncomplete = () => resolve();
-			tx.onerror = () => resolve();
-			tx.onabort = () => resolve();
-		}
-		catch {
-			resolve();
-		}
-	});
-}
-
-// ── 记录读写：内存 → sys_Storage → IndexedDB 逐级读取；写则尽力全写 ──
+// ── 记录读写：内存缓存 → sys_Storage；写失败显式上抛，不做静默降级 ──
 
 function parseRecord(raw: string): CatalogStoreRecord | null {
 	if (!raw)
@@ -209,39 +113,41 @@ function parseRecord(raw: string): CatalogStoreRecord | null {
 	return null;
 }
 
-/** 读目录记录：内存 → sys_Storage → IndexedDB。全部未命中返回 null。 */
+/** 读目录记录：内存缓存 → sys_Storage。全部未命中返回 null。 */
 export async function loadCatalogRecord(): Promise<CatalogStoreRecord | null> {
 	if (memoryRecord)
 		return memoryRecord;
 	const hit = parseRecord(sysGet(STORE_KEY));
-	if (hit) {
-		memoryRecord = hit;
-		return hit;
-	}
-	const idbRaw = await idbGet(STORE_KEY);
-	const idbHit = parseRecord(idbRaw);
-	if (idbHit) {
-		memoryRecord = idbHit;
-		// 回填更稳的一级存储（尽力而为）
-		sysSet(STORE_KEY, idbRaw);
-		return idbHit;
-	}
-	return null;
+	if (!hit)
+		return null;
+	memoryRecord = hit;
+	return hit;
 }
 
-/** 写目录记录：内存永远写；sys_Storage / IndexedDB 尽力写（互为备份，允许部分失败）。 */
+/**
+ * 写目录记录：内存必写（保证落盘失败时本会话仍可用）；落盘失败带上业务上下文上抛。
+ * 抛出的错误经 refresh_catalog 工具错误通道反馈给模型与用户。
+ */
 export async function saveCatalogRecord(rec: CatalogStoreRecord): Promise<void> {
 	memoryRecord = rec;
-	const raw = JSON.stringify(rec);
-	const sysOk = sysSet(STORE_KEY, raw);
-	if (!sysOk)
-		await idbSet(STORE_KEY, raw);
+	try {
+		await sysSet(STORE_KEY, JSON.stringify(rec));
+	}
+	catch (e) {
+		const why = e instanceof Error ? e.message : String(e);
+		throw new Error(`目录已拉取但落盘失败：仅本次会话可用，重启后需重新 refresh_catalog。原因：${why}`);
+	}
 }
 
+/** 清目录记录：内存必清；磁盘残留尽力而为（下次 refresh_catalog 落盘会整体覆盖），仅记日志。 */
 export async function clearCatalogRecord(): Promise<void> {
 	memoryRecord = null;
-	sysDelete(STORE_KEY);
-	await idbDelete(STORE_KEY);
+	try {
+		await sysDelete(STORE_KEY);
+	}
+	catch (e) {
+		console.warn('[cbb-copilot] 目录缓存删除失败（下次 refresh_catalog 落盘会覆盖）:', e);
+	}
 }
 
 // ── 目录写入与查询 ───────────────────────────────────────────────────
@@ -263,7 +169,7 @@ export function catalogStatsOf(report: CatalogFetchReport): CatalogStatsView {
 	};
 }
 
-/** 拉取结果落盘：构建记录并写入三级存储。 */
+/** 拉取结果落盘：构建记录并写入存储（落盘失败会抛出，见 saveCatalogRecord）。 */
 export async function storeCatalog(report: CatalogFetchReport): Promise<CatalogStatsView> {
 	const stats = catalogStatsOf(report);
 	await saveCatalogRecord({
@@ -297,11 +203,6 @@ export async function lookupModule(cbbUuid: string): Promise<FlatModule | null> 
 	if (!rec)
 		return null;
 	return flattenCatalog(rec.catalog).find(m => m.uuid === cbbUuid) || null;
-}
-
-/** 同步读取已加载的内存记录（仅命中内存层，不触发磁盘读）；未加载返回 null。 */
-export function memoryRecordIfLoaded(): CatalogStoreRecord | null {
-	return memoryRecord;
 }
 
 /**

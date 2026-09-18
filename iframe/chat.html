@@ -102,7 +102,9 @@
   /* 首段以 AI 内容开头时（欢迎语/状态提示）给顶部留一点呼吸，用户气泡开头则贴住 header */
   .seg:first-child .col.ai:first-child, .seg:first-child .sysnote:first-child{ padding-top:12px; }
   .bubble{width:100%; padding:9px 13px; border-radius:12px; word-break:break-word;}
-  .bubble.user{background:var(--selected); color:var(--text); border:1px solid var(--line-3);}
+  /* 用户气泡可点击：滚动会话定位到该消息开头 */
+  .bubble.user{background:var(--selected); color:var(--text); border:1px solid var(--line-3); cursor:pointer;}
+  .bubble.user:hover{border-color:var(--blue-line);}
   .ai-body b{color:inherit; font-weight:700;}
   .caret{display:inline-block;width:7px;height:14px;background:var(--blue);
     vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite;}
@@ -740,6 +742,17 @@
       const detail = tool.querySelector('.tool-detail');
       if (detail && detail.textContent) tool.classList.toggle('open');
     }
+  });
+  /* ── 点击用户气泡：滚动会话定位到该消息所在分段的开头 ──
+     每条用户消息开启一个 .seg 分段，气泡本身随滚动吸顶，故锚点即其所在 seg 的顶部。 */
+  msgList.addEventListener('click', e => {
+    const bubble = e.target.closest('.bubble.user');
+    if (!bubble || !msgList.contains(bubble)) return;
+    const seg = bubble.closest('.seg');
+    if (!seg || !msgList.contains(seg)) return;
+    const top = seg.offsetTop - msgList.offsetTop;
+    const maxTop = msgList.scrollHeight - msgList.clientHeight;
+    msgList.scrollTop = Math.max(0, Math.min(top, maxTop));
   });
   function addUserMsg(text) {
     $('#page-chat').classList.remove('empty'); /* 首条消息后隐藏空会话首屏 */

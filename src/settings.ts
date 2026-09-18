@@ -60,8 +60,14 @@ export const DEFAULT_PLACEMENT_SETTINGS: PlacementSettings = {
 	margin: 40,
 };
 
-function storage(): { getExtensionUserConfig?: (k: string) => string; setExtensionUserConfig?: (k: string, v: string) => void } | undefined {
-	return (edaGlobal()?.sys_Storage ?? undefined) as { getExtensionUserConfig?: (k: string) => string; setExtensionUserConfig?: (k: string, v: string) => void } | undefined;
+interface SysStorageApi {
+	/** 官方 sys_Storage 签名：get 同步返回任意值（key 不存在为 undefined）；set 返回 Promise<boolean>。 */
+	getExtensionUserConfig?: (k: string) => unknown;
+	setExtensionUserConfig?: (k: string, v: string) => Promise<boolean>;
+}
+
+function storage(): SysStorageApi | undefined {
+	return (edaGlobal()?.sys_Storage ?? undefined) as SysStorageApi | undefined;
 }
 
 function lsGet(key: string): string {
@@ -86,7 +92,9 @@ function sysGet(key: string): string {
 }
 function sysSet(key: string, val: string): void {
 	try {
-		storage()?.setExtensionUserConfig?.(key, val);
+		// 官方签名返回 Promise<boolean>：不处理会产生 unhandled rejection，显式吞掉
+		// （设置落盘尽力而为；设置保存是同步桥方法，异步失败无法同步感知）。
+		void Promise.resolve(storage()?.setExtensionUserConfig?.(key, val)).catch(() => { /* 尽力而为 */ });
 	}
 	catch { /* 独立脚本环境无 sys_Storage */ }
 }

@@ -18,6 +18,7 @@ export const AGENT_SYSTEM_PROMPT = [
 	'9. 没有合适模块时 picks 为空数组，并在 notFoundHint 与回复正文说明：可把开源广场模块复制到个人库/团队库后调用 refresh_catalog 刷新目录。',
 	'10. 回复用中文，可用 Markdown 排版提升可读性：**加粗**模块名与关键参数、行内代码 `uuid`、列表、表格、```围栏代码块```。不要输出图片和 HTML 标签。不要在回复中写出 apiKey 或完整密钥。',
 	'11. 可以新建图页、新建板子或新建工程后再放置。新建工程会先保存当前工程再切换，避免未保存弹窗阻塞；确认卡上须让用户知情。',
+	'12. 对话较长（上下文摘要显示轮数超过 8）或发现缺少早期对话中的约定/结果时，调用 compact_history 折叠早期对话：summary 写入自足的中文摘要（用户的要求与约束、已完成/进行中的事项、已达成的决定）；最近几轮会原样保留，不影响当前任务。',
 ].join('\n');
 
 const PROPOSE_PLACEMENT_PARAMS = {
@@ -93,6 +94,15 @@ const REFRESH_CATALOG_PARAMS = {
 
 const EMPTY_PARAMS = { type: 'object', properties: {}, additionalProperties: false } as const;
 
+const COMPACT_HISTORY_PARAMS = {
+	type: 'object',
+	additionalProperties: false,
+	properties: {
+		summary: { type: 'string', description: '此前对话的自足中文摘要：用户提出的要求与约束、已完成/进行中的事项、已达成的决定、未解决的问题。写入后早期对话将被折叠，此后只能看到本摘要与最近几轮。' },
+	},
+	required: ['summary'],
+} as const;
+
 /**
  * 工具注册表（单一事实源）：名称 / 描述 / 参数 schema 全部只在这里登记；
  * AgentToolName 与 AGENT_TOOL_NAMES 由本表推导，loop.ts 的执行分发表（Record<AgentToolName, Handler>）
@@ -107,6 +117,7 @@ export const AGENT_TOOLS = [
 	{ name: 'propose_edit', description: '向用户出示模块名称/描述编辑确认卡（不会真正写库）。', parameters: PROPOSE_EDIT_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'propose_export', description: '向用户出示工程包导出确认卡（不会真正写文件）。产出 zip：catalog.json 清单 + 本地模块 .eprj2 工程文件；用户可在卡上勾选要导出的模块，云端模块仅清单留痕。', parameters: EMPTY_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'self_check', description: '探测宿主 API 与桥接是否可用，返回诊断文本。', parameters: EMPTY_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'compact_history', description: '折叠早期对话：用一段摘要替换较早的历史（最近几轮原样保留），防止上下文膨胀与早期信息丢失。上下文摘要显示轮数超过 8、或你发现缺少早期对话中的约定/结果时调用；把此前对话的完整摘要写入 summary。', parameters: COMPACT_HISTORY_PARAMS as unknown as Record<string, unknown> },
 ] as const;
 
 export type AgentToolName = (typeof AGENT_TOOLS)[number]['name'];
@@ -137,4 +148,3 @@ export function toolsAnthropic(): unknown {
 		input_schema: t.parameters,
 	}));
 }
-
