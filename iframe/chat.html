@@ -370,12 +370,6 @@
           <div class="frow"><label>model</label><div class="fctl">
             <input type="text" id="setModel" value="" placeholder="如 deepseek-chat / claude-sonnet-4-5">
           </div></div>
-          <div class="frow"><label>思考模式</label><div class="fctl">
-            <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-2);cursor:pointer">
-              <input type="checkbox" id="setThinking" style="accent-color:var(--blue)">
-              展示模型的思考过程（思维链）
-            </label>
-          </div></div>
           <div class="frow"><label></label><div class="fctl">
             <button class="btn primary" id="saveSettings">保存设置</button>
             <button class="btn" id="testConn">测试连接</button>
@@ -542,7 +536,7 @@
 
   const mockBridge = {
     version: '0.4.0-mock',
-    getLlmSettings() { return { provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value, enableThinking: !!$('#setThinking').checked }; },
+    getLlmSettings() { return { provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value }; },
     saveLlmSettings() { return; },
     onAgentEvent(_sid, handler) { mockEventHandler = typeof handler === 'function' ? handler : null; },
     abortChatTurn() { mockAborted = true; return true; },
@@ -1433,7 +1427,6 @@
         $('#setBase').value = s.baseUrl || '';
         $('#setKey').value = s.apiKey || '';
         $('#setModel').value = s.model || '';
-        $('#setThinking').checked = !!s.enableThinking;
       }
     } catch (e) {}
     try {
@@ -1491,7 +1484,7 @@
 
   $('#saveSettings').onclick = () => {
     try {
-      bridge.saveLlmSettings({ provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value, enableThinking: !!$('#setThinking').checked });
+      bridge.saveLlmSettings({ provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value });
       if (typeof bridge.savePlacementSettings === 'function') {
         const hex = v => (/^#[0-9a-fA-F]{6}$/.test(String(v).trim()) ? String(v).trim() : '');
         const num = (v, min) => (Number.isFinite(+v) && +v > (min || 0) ? +v : null);

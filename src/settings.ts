@@ -11,8 +11,6 @@ export interface LlmSettings {
 	baseUrl: string;
 	apiKey: string;
 	model: string;
-	/** 思考模式开关：true 时请求端点返回思维链（reasoning/thinking），聊天面板可展开查看。 */
-	enableThinking: boolean;
 }
 
 function parseProvider(raw: string): LlmProvider {
@@ -29,7 +27,6 @@ const K_PROVIDER = 'llm_provider';
 const K_BASE = 'llm_base_url';
 const K_KEY = 'llm_api_key';
 const K_MODEL = 'llm_model';
-const K_THINKING = 'llm_enable_thinking';
 const K_SCOPE = 'library_scope';
 const K_LOCAL_PATH = 'local_library_path';
 const K_PLACE = 'placement_settings';
@@ -95,13 +92,11 @@ function sysSet(key: string, val: string): void {
 }
 
 export function getLlmSettings(): LlmSettings {
-	const thinkRaw = (lsGet(K_THINKING) || sysGet(K_THINKING) || '').trim().toLowerCase();
 	return {
 		provider: parseProvider(lsGet(K_PROVIDER) || sysGet(K_PROVIDER) || 'openai-chat'),
 		baseUrl: lsGet(K_BASE) || sysGet(K_BASE),
 		apiKey: lsGet(K_KEY) || sysGet(K_KEY),
 		model: lsGet(K_MODEL) || sysGet(K_MODEL),
-		enableThinking: thinkRaw === '1' || thinkRaw === 'true',
 	};
 }
 
@@ -115,8 +110,6 @@ export function saveLlmSettings(s: LlmSettings): void {
 	sysSet(K_KEY, s.apiKey || '');
 	lsSet(K_MODEL, s.model || '');
 	sysSet(K_MODEL, s.model || '');
-	lsSet(K_THINKING, s.enableThinking ? '1' : '0');
-	sysSet(K_THINKING, s.enableThinking ? '1' : '0');
 }
 
 export function getLibraryScope(): Record<string, boolean> {

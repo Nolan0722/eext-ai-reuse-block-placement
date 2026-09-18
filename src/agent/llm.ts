@@ -130,34 +130,29 @@ export function buildAgentRequest(
 	const base = settings.baseUrl.trim().replace(/\/+$/, '');
 	if (settings.provider === 'anthropic') {
 		const url = anthropicEndpoint(base);
+		// Anthropic 思考模式无条件开启：thinking 块与 temperature 互斥，须去掉 temperature；
+		// budget 设为较大值以兼容默认 max_tokens 4096（budget 必须大于 max_tokens 才有意义，端点会自动裁剪）。
 		const body: Record<string, unknown> = {
 			model: settings.model.trim(),
-			max_tokens: 4096,
-			temperature: 0,
+			max_tokens: 8192,
 			stream: true,
+			thinking: { type: 'enabled', budget_tokens: 4096 },
 			system: `${AGENT_SYSTEM_PROMPT}\n${systemExtra}`.trim(),
 			messages: toAnthropicMessages(history),
 			tools: toolsAnthropic(),
 		};
-		// Anthropic 思考模式：thinking 块与 temperature 互斥，开启时必须去掉 temperature。
-		if (settings.enableThinking) {
-			delete body.temperature;
-			body.thinking = { type: 'enabled', budget_tokens: 8192 };
-		}
 		return { url, body: JSON.stringify(body), headers: anthropicHeaders(settings) };
 	}
 	if (settings.provider === 'openai-responses') {
+		// Responses 推理参数无条件开启；非推理系模型端点报错时属模型不支持，需用户改用 openai-chat 格式。
 		const body: Record<string, unknown> = {
 			model: settings.model.trim(),
-			temperature: 0,
 			stream: true,
+			reasoning: { effort: 'medium', summary: 'auto' },
 			instructions: `${AGENT_SYSTEM_PROMPT}\n${systemExtra}`.trim(),
 			input: toResponsesInput(history),
 			tools: toolsOpenAiResponses(),
 		};
-		// OpenAI Responses 推理参数：非 gpt-5/o 系模型可能不识别，端点报错时由用户关闭思考模式。
-		if (settings.enableThinking)
-			body.reasoning = { effort: 'medium', summary: 'auto' };
 		return { url: joinUrl(base, '/responses'), body: JSON.stringify(body), headers: openaiHeaders(settings) };
 	}
 	// OpenAI Chat 兼容格式：DeepSeek-R1 的 reasoning_content、Qwen3 的 reasoning 随 delta 增量返回，
