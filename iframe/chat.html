@@ -145,6 +145,17 @@
   .tool.running .tool-line{color:var(--text-2);}
   @keyframes tool-rotate{to{transform:rotate(360deg);}}
   @keyframes tool-pulse{0%,100%{opacity:1;}50%{opacity:.45;}}
+  /* ── 思维链（reasoning）折叠块：默认展开跟随流出，结束后自动收起 ── */
+  .tool.reasoning{cursor:pointer;}
+  .tool.reasoning .tool-line{color:var(--text-3);}
+  .tool.reasoning .tool-label{font-style:normal;}
+  .reasoning-stream{display:none; padding:2px 0 4px 19px; color:var(--text-3); font-size:12.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word;}
+  .tool.reasoning.open .reasoning-stream{display:block;}
+  .tool.reasoning.streaming .reasoning-stream{display:block;}
+  .tool.reasoning.streaming .tool-spin{display:block;}
+  .tool.reasoning.streaming .tool-spin svg{animation:tool-rotate .9s linear infinite;}
+  .tool.reasoning.streaming .tool-line .tool-caret{transform:rotate(90deg);}
+  .tool.reasoning.streaming .tool-label{animation:tool-pulse 1.4s ease-in-out infinite;}
   .tool-line .tool-label{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   /* 整轮计时组：展开显示本轮工具行，收起隐藏 */
   .tool .tool-sub{display:none; flex-direction:column; padding-left:19px;}
@@ -247,6 +258,9 @@
   #send:not(:disabled){background:var(--blue); color:#fff;}
   #send:not(:disabled):hover{background:var(--blue-2);}
   #send:disabled{cursor:not-allowed;}
+  /* 停止态：红色方块按钮（发送中点击 = 中止本轮） */
+  #send.stopping{background:var(--red); color:#fff;}
+  #send.stopping:hover{background:#c22c31;}
   #page-settings{overflow-y:auto; padding:18px 20px 30px; display:none;}
   #page-settings.on{display:block;}
   .sec{border:1px solid var(--line); border-radius:var(--radius); background:var(--panel);
@@ -355,6 +369,12 @@
           </div></div>
           <div class="frow"><label>model</label><div class="fctl">
             <input type="text" id="setModel" value="" placeholder="如 deepseek-chat / claude-sonnet-4-5">
+          </div></div>
+          <div class="frow"><label>思考模式</label><div class="fctl">
+            <label style="display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-2);cursor:pointer">
+              <input type="checkbox" id="setThinking" style="accent-color:var(--blue)">
+              展示模型的思考过程（思维链）
+            </label>
           </div></div>
           <div class="frow"><label></label><div class="fctl">
             <button class="btn primary" id="saveSettings">保存设置</button>
@@ -493,7 +513,19 @@
 
   let mockCatalog = null;
   let mockTokenSeq = 1;
+  let mockEventHandler = null;
+  let mockAborted = false;
   const mockOpenTokens = new Map();
+
+  /** mock 事件流：模拟真实 agent 的增量行为（思考 → 正文逐字 → 工具 Running→完成）。 */
+  async function mockEmitText(text, speed) {
+    for (let i = 0; i < text.length; i += speed) {
+      if (mockAborted) return false;
+      mockEventHandler?.({ type: 'text_delta', delta: text.slice(i, i + speed) });
+      await sleep(24);
+    }
+    return !mockAborted;
+  }
 
   function mockAllModules() {
     const cat = mockCatalog || MOCK_CATALOG;
@@ -510,8 +542,10 @@
 
   const mockBridge = {
     version: '0.4.0-mock',
-    getLlmSettings() { return { provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value }; },
+    getLlmSettings() { return { provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value, enableThinking: !!$('#setThinking').checked }; },
     saveLlmSettings() { return; },
+    onAgentEvent(_sid, handler) { mockEventHandler = typeof handler === 'function' ? handler : null; },
+    abortChatTurn() { mockAborted = true; return true; },
     getLibraryScope() { return { personal: true, team: true, local: true }; },
     saveLibraryScope() { return; },
     getLocalLibraryPath() { return ''; },
@@ -522,46 +556,73 @@
     getPlacementSettings() { return { gapX: 80, gapY: 80, borderColor: '', borderWidth: null, margin: 40 }; },
     savePlacementSettings() { return; },
     async chatTurn(_sid, userText) {
-      await sleep(400);
+      await sleep(300);
       const t = String(userText || '');
+      mockAborted = false;
+      const ev = (x) => { if (!mockAborted) mockEventHandler?.(x); };
+      const runTool = async (name, argsSummary, detail, ms) => {
+        ev({ type: 'tool_start', name, argsSummary });
+        await sleep(ms || 500);
+        if (mockAborted) return null;
+        const event = { name, argsSummary, status: 'ok', detail };
+        ev({ type: 'tool_end', seqId: 0, event });
+        return event;
+      };
+      const finish = async (text, extra) => {
+        await mockEmitText(text, 3);
+        ev({ type: 'final', result: Object.assign({ assistantText: text, tools, cards, llmConfigured: true }, extra || {}) });
+        return { assistantText: text, tools, cards, llmConfigured: true };
+      };
       const tools = [];
       const cards = [];
+      if (mockAborted) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
       if (!mockCatalog) {
-        await sleep(500);
+        const tool = await runTool('get_catalog', '会话首次拉取', MOCK_CATALOG.stats, 600);
+        if (!tool) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
+        tools.push(tool);
         mockCatalog = MOCK_CATALOG;
-        tools.push({ name: 'get_catalog', argsSummary: '会话首次拉取', status: 'ok', detail: mockCatalog.stats });
       }
       if (/导出/.test(t)) {
         const token = 'mock-export-' + mockTokenSeq++;
         mockOpenTokens.set(token, 'export');
-        cards.push({ type: 'export', token, stats: mockCatalog.stats });
-        return { assistantText: '导出前先确认统计信息（不含 apiKey）。', tools, cards, llmConfigured: true };
+        const card = { type: 'export', token, stats: mockCatalog.stats };
+        cards.push(card);
+        ev({ type: 'card', card });
+        return await finish('导出前先确认统计信息（不含 apiKey）。');
       }
       if (/(描述|名称|名字).*(改|换|修|补|写|规范)|^(改|修|补|编辑|帮).*(描述|名称|名字)/.test(t)) {
         const empty = mockAllModules().find(m => !m.description) || mockAllModules()[0];
         const token = 'mock-edit-' + mockTokenSeq++;
         mockOpenTokens.set(token, 'edit');
-        cards.push({ type: 'edit', token, libraryUuid: empty.libraryUuid, cbbUuid: empty.uuid, src: empty.src, origName: empty.name, name: empty.name, description: empty.description });
-        return { assistantText: `找到模块 **${empty.name}**（${empty.src}）。${empty.description ? '可在卡片中修改。' : '描述为空，建议按模板补写。'}`, tools, cards, llmConfigured: true };
+        const card = { type: 'edit', token, libraryUuid: empty.libraryUuid, cbbUuid: empty.uuid, src: empty.src, origName: empty.name, name: empty.name, description: empty.description };
+        cards.push(card);
+        ev({ type: 'card', card });
+        return await finish(`找到模块 **${empty.name}**（${empty.src}）。${empty.description ? '可在卡片中修改。' : '描述为空，建议按模板补写。'}`);
       }
       if (/(失败|断网|错误|401|404|429|超时|鉴权)/.test(t)) {
-        tools.push({ name: 'llm.request', argsSummary: 'anthropic', status: 'err', error: '401', detail: 'HTTP 401 authentication_error' });
-        return { assistantText: '调用模型端点失败了：**鉴权失败**——通常是 apiKey 无效或已过期。请到 设置 → 模型接入 检查 Key。', tools, cards, gotoSettings: true, llmConfigured: true, error: { kind: 'auth', message: '401', gotoSettings: true } };
+        const tool = await runTool('llm.request', 'anthropic', 'HTTP 401 authentication_error', 400);
+        if (!tool) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
+        tools.push(tool);
+        return await finish('调用模型端点失败了：**鉴权失败**——通常是 apiKey 无效或已过期。请到 设置 → 模型接入 检查 Key。', { gotoSettings: true, error: { kind: 'auth', message: '401', gotoSettings: true } });
       }
       if (/千兆|以太网|PHY/.test(t)) {
-        return { assistantText: '目录中没有匹配「千兆以太网 PHY」的模块。\n建议把开源广场模块复制到个人库后再刷新目录（插件不覆盖开源广场）。', tools, cards, llmConfigured: true };
+        return await finish('目录中没有匹配「千兆以太网 PHY」的模块。\n建议把开源广场模块复制到个人库后再刷新目录（插件不覆盖开源广场）。');
       }
       if (/(本地|边界|整页.*不支持|图页.*不支持|能力)/.test(t)) {
         const local = mockAllModules().find(m => m.libraryKind === 'local');
         const token = 'mock-place-' + mockTokenSeq++;
         mockOpenTokens.set(token, 'place');
-        cards.push({ type: 'place', token, filtered: [], picks: [{ uuid: local.uuid, libraryUuid: local.libraryUuid, name: local.name, src: local.src, reason: local.reason, pageSupport: false, mode: 'symbol', target: 'current' }] });
-        return { assistantText: `以本地库模块 **${local.name}** 演示：支持符号放置（带标注）与编辑，**不支持复用模块图页**（get 接口对本地模块会崩溃）。云端个人库与团队库都是全链路可用库。\n\n半离线模式需在设置里按 config.json 的 \`LIB_DIR\` 填本地库路径：\n\n\`\`\`json\n{ "type": "HALF_OFFLINE", "LIB_DIR": ["D:/LCEDA-Pro/library"] }\n\`\`\``, tools, cards, llmConfigured: true };
+        const card = { type: 'place', token, filtered: [], picks: [{ uuid: local.uuid, libraryUuid: local.libraryUuid, name: local.name, src: local.src, reason: local.reason, pageSupport: false, mode: 'symbol', target: 'current' }] };
+        cards.push(card);
+        ev({ type: 'card', card });
+        return await finish(`以本地库模块 **${local.name}** 演示：支持符号放置（带标注）与编辑，**不支持复用模块图页**（get 接口对本地模块会崩溃）。云端个人库与团队库都是全链路可用库。\n\n半离线模式需在设置里按 config.json 的 \`LIB_DIR\` 填本地库路径：\n\n\`\`\`json\n{ "type": "HALF_OFFLINE", "LIB_DIR": ["D:/LCEDA-Pro/library"] }\n\`\`\``);
       }
       if (/(刷新|重新拉).*(目录|列表)|目录.*(刷新)|^(有|列)(哪|什么)|有哪些?模块|模块列表|^目录$/.test(t)) {
         mockCatalog = MOCK_CATALOG;
-        tools.push({ name: 'get_catalog', argsSummary: 'force 刷新', status: 'ok', detail: mockCatalog.stats });
-        return { assistantText: `目录已刷新，共 ${MOCK_MODULES.length} 个模块：\n\n| 库 | 模块数 | 能力 |\n|---|---|---|\n| 个人库（云端） | ${MOCK_MODULES.filter(m => m.libraryKind === 'personal').length} | 目录 / 符号 / 图页 / 编辑 |\n| 本地库 | ${MOCK_MODULES.filter(m => m.libraryKind === 'local').length} | 目录 / 符号 / 编辑，**不支持图页** |\n\n${mockCatalog.stats.emptyDesc ? '⚠ 有 1 个模块**描述为空**，会影响匹配质量，需要我帮你补写吗？' : '要我列出某一类模块吗？'}`, tools, cards, llmConfigured: true };
+        const tool = await runTool('get_catalog', 'force 刷新', MOCK_CATALOG.stats, 400);
+        if (!tool) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
+        tools.push(tool);
+        return await finish(`目录已刷新，共 ${MOCK_MODULES.length} 个模块：\n\n| 库 | 模块数 | 能力 |\n|---|---|---|\n| 个人库（云端） | ${MOCK_MODULES.filter(m => m.libraryKind === 'personal').length} | 目录 / 符号 / 图页 / 编辑 |\n| 本地库 | ${MOCK_MODULES.filter(m => m.libraryKind === 'local').length} | 目录 / 符号 / 编辑，**不支持图页** |\n\n${mockCatalog.stats.emptyDesc ? '⚠ 有 1 个模块**描述为空**，会影响匹配质量，需要我帮你补写吗？' : '要我列出某一类模块吗？'}`);
       }
       if (/(模块|放置|候选|电源|转换|最小系统|充电|滤波|串口|485|CAN)/i.test(t)) {
         let picks = mockAllModules().filter(m => /3\.3|电源|LDO|DCDC|降压|稳压/i.test(m.classification + m.name + t));
@@ -570,11 +631,13 @@
         const token = 'mock-place-' + mockTokenSeq++;
         mockOpenTokens.set(token, 'place');
         const view = picks.map((p, i) => ({ uuid: p.uuid, libraryUuid: p.libraryUuid, name: p.name, src: p.src, reason: p.reason, pageSupport: p.pageSupport, mode: p.pageSupport ? 'page' : 'symbol', target: 'current' }));
-        cards.push({ type: 'place', token, picks: view, filtered: [] });
+        const card = { type: 'place', token, picks: view, filtered: [] };
+        cards.push(card);
+        ev({ type: 'card', card });
         const lines = picks.map((p, i) => `${i + 1}. **${p.name}**（${p.src}）—— ${p.reason}`).join('\n');
-        return { assistantText: `根据「${t}」，筛出 ${picks.length} 个候选：\n${lines}\n\n请在确认卡上确认后放置，落点由插件自动排布并避开已有内容。`, tools, cards, llmConfigured: true };
+        return await finish(`根据「${t}」，筛出 ${picks.length} 个候选：\n${lines}\n\n请在确认卡上确认后放置，落点由插件自动排布并避开已有内容。`);
       }
-      return { assistantText: '我可以帮你：找模块并放置、按模板改描述、导出目录 JSON。放置位置可选当前图页、新建图页、新建板子或新建工程。试着说一个，或点下方建议。', tools, cards, llmConfigured: true };
+      return await finish('我可以帮你：找模块并放置、按模板改描述、导出目录 JSON。放置位置可选当前图页、新建图页、新建板子或新建工程。试着说一个，或点下方建议。');
     },
     async confirmPlace(_sid, token, items) {
       if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
@@ -680,6 +743,11 @@
     if (!line || !msgList.contains(line)) return;
     const tool = line.closest('.tool');
     if (!tool) return;
+    if (tool.classList.contains('reasoning')) {
+      tool.dataset.userToggled = '1';
+      tool.classList.toggle('open');
+      return;
+    }
     if (tool.classList.contains('work')) {
       const opening = !tool.classList.contains('open');
       tool.classList.toggle('open', opening);
@@ -918,8 +986,42 @@
       },
     };
   }
-  function appendGotoSettings(parent) {
-    const btn = document.createElement('button');
+  /* ── 思维链折叠块：流式期间展开跟随，完成 1.2s 后自动收起；点击行切换展开 ── */
+  function addReasoningBlock(parentEl) {
+    const el = document.createElement('div'); el.className = 'tool reasoning streaming open';
+    el.innerHTML = `
+      <div class="tool-line">
+        <span class="tool-spin" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M7 1.5A5.5 5.5 0 1 1 1.5 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span>
+        <span class="tool-label">思考中…</span>
+        <span class="tool-caret" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      </div>
+      <div class="reasoning-stream"></div>`;
+    (parentEl || ensureSeg()).appendChild(el);
+    const label = el.querySelector('.tool-label');
+    const stream = el.querySelector('.reasoning-stream');
+    let text = '';
+    let settleTimer = null;
+    scrollBottom();
+    return {
+      append(delta) {
+        text += String(delta || '');
+        stream.textContent = text;
+        scrollBottom();
+      },
+      /* 结束：label 定格，稍后收起（用户已手动展开则保持展开） */
+      done() {
+        el.classList.remove('streaming');
+        label.textContent = '思考过程';
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => {
+          if (el.classList.contains('streaming')) return;
+          if (!el.dataset.userToggled) el.classList.remove('open');
+        }, 1200);
+      },
+      el,
+    };
+  }
+  function appendGotoSettings(parent) {    const btn = document.createElement('button');
     btn.className = 'btn link';
     btn.textContent = '去设置检查 →';
     btn.onclick = () => switchTab('settings');
@@ -1134,29 +1236,124 @@
     });
   }
 
+  /* ── 实时事件渲染：sendBtn 在发送中变为停止按钮 ──
+     事件流（onAgentEvent）驱动 UI：reasoning/text 增量、工具 Running→完成、卡片即时出现；
+     chatTurn 的 Promise resolve（final 快照）只做对账：目录失效标记与去设置入口。 */
+  let currentAi = null;      /* 本轮正文气泡（流式 append） */
+  let currentReasoning = null; /* 本轮思维链折叠块 */
+  let liveTools = [];        /* seqId → 工具行句柄 */
+  let currentWork = null;    /* 整轮计时器句柄 */
+  let stopRequested = false;
+
+  function setSendAsStop(isStop) {
+    sendBtn.classList.toggle('stopping', isStop);
+    sendBtn.title = isStop ? '停止生成' : '发送 (Enter)';
+    sendBtn.innerHTML = isStop
+      ? '<svg viewBox="0 0 24 24" fill="none"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none"><path d="M12 19V6M12 5l-6.5 6.5M12 5l6.5 6.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  }
+
+  function ensureAiBubble() {
+    if (!currentAi) {
+      currentAi = addAiBubble();
+      currentAi.el.innerHTML = '';
+    }
+    return currentAi;
+  }
+
+  function handleAgentEvent(ev) {
+    if (ev.type === 'reasoning_delta') {
+      if (!currentReasoning) currentReasoning = addReasoningBlock(workBody());
+      currentReasoning.append(ev.delta);
+      return;
+    }
+    if (ev.type === 'text_delta') {
+      const b = ensureAiBubble();
+      b.text += ev.delta;
+      b.el.innerHTML = mdRich(b.text);
+      scrollBottom();
+      return;
+    }
+    if (ev.type === 'tool_start') {
+      /* tool_start 与 tool_end 通过数组下标（seqId）对位 */
+      const tb = addToolBubble(ev.name, ev.argsSummary || '', workBody());
+      liveTools.push(tb);
+      return;
+    }
+    if (ev.type === 'tool_end') {
+      const tb = liveTools[ev.seqId];
+      if (!tb) return;
+      const t = ev.event;
+      if (t.status === 'ok') tb.done(t.detail);
+      else if (t.status === 'skip') tb.skip(t.error || '已跳过');
+      else tb.fail(t.error || '失败', t.detail);
+      return;
+    }
+    if (ev.type === 'card') {
+      renderCards([ev.card]);
+      return;
+    }
+    if (ev.type === 'final') {
+      /* final 快照对账：卡片失效由目录刷新检测驱动；正文/工具已实时渲染，不再重画 */
+      const res = ev.result;
+      if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
+        invalidateCards('目录已更新');
+      if (res.error && res.error.kind === 'aborted') {
+        if (currentAi && !currentAi.text) { currentAi.el.innerHTML = '<i>（已停止）</i>'; }
+        addNote('已停止本轮回复');
+        return;
+      }
+      if (res.error && res.error.gotoSettings) {
+        const b = ensureAiBubble();
+        appendGotoSettings(b.el.parentElement);
+      }
+      /* 极少数端点错误时 assistantText 未经过增量（recovery 话术）：补渲染 */
+      if (res.error && !currentAi) {
+        const b = addAiBubble();
+        b.el.innerHTML = mdRich(res.assistantText || '');
+        scrollBottom();
+      }
+    }
+  }
+
+  function workBody() { return currentWork ? currentWork.body : null; }
+
   async function handleUser(text) {
     const t = String(text || '').trim();
     if (!t || busy) return;
     busy = true;
+    stopRequested = false;
     syncSendState();
+    setSendAsStop(true);
     addUserMsg(t);
     markCardsRisk();
-    const work = addWorkTimer(); /* 整轮计时：从消息发出起算 */
+    currentWork = addWorkTimer();
+    currentAi = null; currentReasoning = null; liveTools = [];
     try {
-      const res = await bridge.chatTurn(SESSION_ID, t);
-      if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
-        invalidateCards('目录已更新');
-      renderTools(res.tools, work.body);
-      const b = await streamAi(res.assistantText || '', 3);
-      if (res.gotoSettings || (res.error && res.error.gotoSettings))
-        appendGotoSettings(b.el.parentElement);
-      renderCards(res.cards);
+      if (typeof bridge.onAgentEvent === 'function') {
+        bridge.onAgentEvent(SESSION_ID, handleAgentEvent);
+        await bridge.chatTurn(SESSION_ID, t);
+      } else {
+        /* 旧桥（无事件通道）：退回整批渲染 */
+        const res = await bridge.chatTurn(SESSION_ID, t);
+        if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
+          invalidateCards('目录已更新');
+        renderTools(res.tools, work.body);
+        await streamAi(res.assistantText || '', 3);
+        if (res.gotoSettings || (res.error && res.error.gotoSettings))
+          appendGotoSettings(document.querySelector('.col.ai:last-child') || work.body);
+        renderCards(res.cards);
+      }
     } catch (e) {
       addNote('会话出现异常：' + (e.message || e));
     }
+    if (currentReasoning) currentReasoning.done();
     busy = false;
+    stopRequested = false;
+    setSendAsStop(false);
     syncSendState();
-    work.done();
+    currentWork.done();
+    currentAi = null; currentReasoning = null; liveTools = [];
   }
 
   function switchTab(name) {
@@ -1200,7 +1397,7 @@
     input.style.height = Math.min(input.scrollHeight, 132) + 'px';
   }
   function syncSendState() {
-    sendBtn.disabled = busy || !input.value.trim();
+    sendBtn.disabled = busy ? stopRequested : !input.value.trim();
   }
   input.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -1209,7 +1406,18 @@
     }
   });
   input.addEventListener('input', () => { autosize(); syncSendState(); });
-  sendBtn.onclick = () => { if (!sendBtn.disabled) { handleUser(input.value); input.value = ''; autosize(); syncSendState(); } };
+  sendBtn.onclick = () => {
+    if (busy) {
+      /* 发送中 = 停止按钮：请求扩展中止本轮（旧桥无此能力则忽略） */
+      if (typeof bridge.abortChatTurn === 'function' && !stopRequested) {
+        stopRequested = true;
+        sendBtn.disabled = true;
+        try { bridge.abortChatTurn(SESSION_ID); } catch (e) {}
+      }
+      return;
+    }
+    if (!sendBtn.disabled) { handleUser(input.value); input.value = ''; autosize(); syncSendState(); }
+  };
   syncSendState();
 
   $('#toggleKey').onclick = () => {
@@ -1225,6 +1433,7 @@
         $('#setBase').value = s.baseUrl || '';
         $('#setKey').value = s.apiKey || '';
         $('#setModel').value = s.model || '';
+        $('#setThinking').checked = !!s.enableThinking;
       }
     } catch (e) {}
     try {
@@ -1282,7 +1491,7 @@
 
   $('#saveSettings').onclick = () => {
     try {
-      bridge.saveLlmSettings({ provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value });
+      bridge.saveLlmSettings({ provider: $('#setFormat').value, baseUrl: $('#setBase').value, apiKey: $('#setKey').value, model: $('#setModel').value, enableThinking: !!$('#setThinking').checked });
       if (typeof bridge.savePlacementSettings === 'function') {
         const hex = v => (/^#[0-9a-fA-F]{6}$/.test(String(v).trim()) ? String(v).trim() : '');
         const num = (v, min) => (Number.isFinite(+v) && +v > (min || 0) ? +v : null);

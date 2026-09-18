@@ -1,10 +1,11 @@
 /**
  * 扩展入口 + iframe 桥。UI 在 iframe/chat.html；写画布/写库/导出必须走确认卡令牌。
  */
-import type { CatalogStatsView, ChatTurnResult, PlaceCbbItem } from './agent/loop';
+import type { AgentEvent, CatalogStatsView, ChatTurnResult, PlaceCbbItem } from './agent/loop';
 import type { ClientEnv } from './env';
 import type { LlmSettings, PlacementSettings } from './settings';
 import * as extensionConfig from '../extension.json';
+import { abortSession } from './agent/http';
 import { cancelCard, chatTurn, confirmEdit, confirmExport, confirmPlace, resetChatSession, testLlmConnection } from './agent/loop';
 import { detectClientEnv, runSelfCheck } from './env';
 import { edaGlobal } from './host';
@@ -26,6 +27,10 @@ export interface CbbCopilotBridge {
 	importProjectPackage: () => Promise<{ ok: boolean; imported: Array<string>; failed: Array<{ file: string; error: string }>; targetDir: string; note?: string; error?: string }>;
 	getPlacementSettings: () => PlacementSettings;
 	savePlacementSettings: (s: PlacementSettings) => void;
+	/** 注册 Agent 事件监听（每次 chatTurn 实时推送 reasoning/text delta、工具状态、卡片）。重复注册覆盖旧监听。 */
+	onAgentEvent: (sessionId: string, handler: (ev: AgentEvent) => void) => void;
+	/** 中止进行中的 chatTurn（按钮置为停止时的调用）。返回是否有进行中的轮次被中止。 */
+	abortChatTurn: (sessionId: string) => boolean;
 	chatTurn: (sessionId: string, userText: string) => Promise<ChatTurnResult>;
 	confirmPlace: (sessionId: string, token: string, items: Array<PlaceCbbItem>, grid?: { dx: number; dy: number }) => Promise<{ results: Array<{ cbbUuid: string; name: string; ok: boolean; error?: string; pageName?: string; fallbackFromSymbol?: boolean }> }>;
 	confirmEdit: (sessionId: string, token: string, editable: { name: string; description: string }) => Promise<{ ok: boolean; error?: string }>;
@@ -36,6 +41,9 @@ export interface CbbCopilotBridge {
 	testConnection: () => Promise<{ ok: boolean; model: string; latencyMs: number; error?: string }>;
 	getClientEnv: () => Promise<ClientEnv>;
 }
+
+/** 会话 → 事件监听（UI 注册；同一会话只保留最新监听，UI 重载后自动覆盖旧引用）。 */
+const agentEventListeners = new Map<string, (ev: AgentEvent) => void>();
 
 function installBridge(): void {
 	const edaRef = edaGlobal();
@@ -54,12 +62,32 @@ function installBridge(): void {
 		importProjectPackage: () => importProjectPackage().catch(e => ({ ok: false, imported: [], failed: [], targetDir: '', error: e instanceof Error ? e.message : String(e) })),
 		getPlacementSettings,
 		savePlacementSettings,
-		chatTurn: (sessionId, userText) => chatTurn(sessionId, userText, VERSION),
+		onAgentEvent: (sessionId, handler) => {
+			if (typeof handler === 'function')
+				agentEventListeners.set(sessionId, handler);
+			else
+				agentEventListeners.delete(sessionId);
+		},
+		abortChatTurn: sessionId => abortSession(sessionId),
+		chatTurn: (sessionId, userText) => chatTurn(sessionId, userText, VERSION, {
+			onEvent: (ev) => {
+				// 监听器异常与 UI 生命周期解耦：回调抛错只记日志，不中断 agent 循环。
+				try {
+					agentEventListeners.get(sessionId)?.(ev);
+				}
+				catch (e) {
+					console.warn('[cbb-copilot] onAgentEvent handler error:', e);
+				}
+			},
+		}),
 		confirmPlace,
 		confirmEdit,
 		confirmExport,
 		cancelCard,
-		resetChatSession,
+		resetChatSession: (sessionId) => {
+			agentEventListeners.delete(sessionId);
+			resetChatSession(sessionId);
+		},
 		selfCheck: () => runSelfCheck(VERSION),
 		testConnection: () => testLlmConnection(),
 		getClientEnv: () => detectClientEnv(),

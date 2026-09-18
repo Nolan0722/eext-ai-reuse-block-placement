@@ -12,8 +12,8 @@ import { activateSchematicPage, cacheGeometry, collectPageObstacles, DEFAULT_PAG
 import { effectiveLibraryScope, runSelfCheck } from '../env';
 import { exportProjectPackage } from '../pkg';
 import { getLlmSettings, getPlacementSettings } from '../settings';
-import { classifyLlmError, sendLlmRequest } from './http';
-import { buildAgentRequest, buildPingRequest, parseAgentResponse } from './llm';
+import { classifyLlmError, registerAbort, releaseAbort, sendLlmRequest, STREAM_SENTINEL } from './http';
+import { buildAgentRequest, buildPingRequest, parseAgentResponse, StreamAccumulator } from './llm';
 import { AGENT_TOOL_NAMES, buildAgentCatalogPayload, MAX_DESC_LEN } from './tools';
 
 const MAX_AGENT_ROUNDS = 4;
@@ -22,6 +22,29 @@ const MAX_TOOL_CALLS = 12;
 const MAX_HISTORY = 12;
 /** propose_placement 单卡最大候选数（与 schema maxItems 一致；网格批量放置的上限）。 */
 const MAX_PLACEMENT_PICKS = 20;
+
+/** Agent 事件流：chatTurn 执行过程中实时推给 UI 的所有事件。 */
+export type AgentEvent
+	/** 一条思维链增量（仅思考模式且端点返回时出现）。 */
+	= | { type: 'reasoning_delta'; delta: string }
+	/** 一条正文增量（流式模式）。 */
+		| { type: 'text_delta'; delta: string }
+	/** 模型发起一次工具调用（UI 立即显示"Running"状态）。 */
+		| { type: 'tool_start'; name: string; argsSummary: string }
+	/** 工具执行结束，与 tool_start 按 seqId 对应（UI 原位更新状态与结果）。 */
+		| { type: 'tool_end'; seqId: number; event: ChatToolEvent }
+	/** 提案确认卡生成（UI 立即渲染卡片，不等整轮结束）。 */
+		| { type: 'card'; card: ChatCardView }
+	/** 整轮结束的最终快照（含完整文本与状态，UI 用于对账）。 */
+		| { type: 'final'; result: ChatTurnResult };
+
+export interface ChatTurnCallbacks {
+	/** 每个事件实时回调；UI 不在场（如测试）时可不传。 */
+	onEvent?: (ev: AgentEvent) => void;
+}
+
+/** onEvent 缺省时的空实现。 */
+function noopEmitter(_ev: AgentEvent): void { /* 忽略 */ }
 
 export interface ChatToolEvent {
 	name: string;
@@ -489,16 +512,25 @@ async function runTool(
 	return TOOL_HANDLERS[name](s, args, bridgeVersion);
 }
 
-export async function chatTurn(sessionId: string, userText: string, bridgeVersion: string): Promise<ChatTurnResult> {
+export async function chatTurn(
+	sessionId: string,
+	userText: string,
+	bridgeVersion: string,
+	callbacks?: ChatTurnCallbacks,
+): Promise<ChatTurnResult> {
 	const text = redactSecrets((userText || '').trim());
 	const s = sessionOf(sessionId);
 	const tools: Array<ChatToolEvent> = [];
 	const cards: Array<ChatCardView> = [];
 	let gotoSettings = false;
 	let toolCallCount = 0;
+	const emit = callbacks?.onEvent ?? noopEmitter;
+	const ac = registerAbort(sessionId);
+	const signal = ac.signal;
 
 	const ready = settingsReady();
 	if (!ready.ok) {
+		releaseAbort(sessionId);
 		return {
 			assistantText: `尚未配置模型接入（缺少 ${ready.missing.join('、')}）。请到 设置 → 模型接入 填写 baseUrl / apiKey / model。出站走嘉立创代理，请使用国内可达端点，不要填 api.openai.com。`,
 			tools,
@@ -509,12 +541,26 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 		};
 	}
 
+	/** 用户中止的统一出口：已推送的增量作废，恢复话术由 UI 以中止标记呈现。 */
+	function abortedResult(): ChatTurnResult {
+		return {
+			assistantText: '（已停止）',
+			tools,
+			cards,
+			gotoSettings,
+			llmConfigured: true,
+			error: { kind: 'aborted', message: '用户中止了本轮回复', gotoSettings: false },
+		};
+	}
+
 	// 目录获取完全由模型调用 get_catalog 驱动（提示词与上下文标注引导），插件不在循环外自动预取。
 	s.history.push({ role: 'user', content: text });
 	trimHistory(s);
 
 	try {
 		for (let round = 0; round < MAX_AGENT_ROUNDS; round++) {
+			if (signal.aborted)
+				return abortedResult();
 			// 每轮重建目录注入：get_catalog(force) 更新会话快照后旧注入必须作废，
 			// 否则同轮上下文里 system 是旧目录、observation 是新目录，模型会被两份目录打架。
 			const catalogNote = s.catalog
@@ -522,17 +568,48 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 				: '\n\n当前没有可用目录快照。请先调用 get_catalog。';
 			const settings = getLlmSettings();
 			const req = buildAgentRequest(settings, catalogNote, s.history);
-			const data = await sendLlmRequest(req);
-			const parsed = parseAgentResponse(settings.provider, data);
+			req.stream = true;
+			// 流式路径：delta 实时转发；累积器负责把三家协议的增量拼回完整响应。
+			// 通道不支持分块时 sendLlmRequest 自动降级返回完整 JSON（旧解析路径）。
+			const acc = new StreamAccumulator();
+			const data = await sendLlmRequest(req, {
+				onChunk: (chunk) => {
+					const { textDelta, reasoningDelta } = acc.feed(settings.provider, chunk);
+					if (reasoningDelta)
+						emit({ type: 'reasoning_delta', delta: reasoningDelta });
+					if (textDelta)
+						emit({ type: 'text_delta', delta: textDelta });
+				},
+			}, signal);
+			if (signal.aborted)
+				return abortedResult();
+			// STREAM_SENTINEL：流式路径已完成（载荷经 acc 拼装）；否则为缓冲完整 JSON。
+			const streamed = data === STREAM_SENTINEL;
+			const parsed = streamed ? acc.result() : parseAgentResponse(settings.provider, data);
+			if (!streamed) {
+				// 缓冲路径没走过增量回调：整段一次性补发，UI 渲染口径与流式一致。
+				if (parsed.reasoning)
+					emit({ type: 'reasoning_delta', delta: parsed.reasoning });
+				if (parsed.text)
+					emit({ type: 'text_delta', delta: parsed.text });
+			}
 			if (!parsed.toolCalls.length) {
 				const assistantText = redactSecrets(parsed.text || '（模型没有返回文本）');
 				s.history.push({ role: 'assistant', content: assistantText });
-				return { assistantText, tools, cards, gotoSettings, llmConfigured: true };
+				const finalResult: ChatTurnResult = { assistantText, tools, cards, gotoSettings, llmConfigured: true };
+				emit({ type: 'final', result: finalResult });
+				return finalResult;
 			}
 			s.history.push({ role: 'assistant', content: parsed.text || '', toolCalls: parsed.toolCalls });
+			// 思维链属于过程信息，不进 history（避免污染下一轮上下文与 token 预算）。
 			for (const call of parsed.toolCalls) {
+				if (signal.aborted)
+					return abortedResult();
 				if (toolCallCount >= MAX_TOOL_CALLS) {
-					tools.push({ name: call.name, argsSummary: '已达调用总量上限', status: 'skip', error: '工具调用总量已达上限' });
+					const skipEvent: ChatToolEvent = { name: call.name, argsSummary: '已达调用总量上限', status: 'skip', error: '工具调用总量已达上限' };
+					tools.push(skipEvent);
+					emit({ type: 'tool_start', name: call.name, argsSummary: '已达调用总量上限' });
+					emit({ type: 'tool_end', seqId: tools.length - 1, event: skipEvent });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson({ ok: false, error: '工具调用总量已达上限，请基于已有信息直接总结回复用户' }),
@@ -543,13 +620,19 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 				}
 				toolCallCount++;
 				const args = (call.arguments && typeof call.arguments === 'object' ? call.arguments : {}) as Record<string, unknown>;
+				const argsSummary = summarizeToolArgs(call.name, args);
+				emit({ type: 'tool_start', name: call.name, argsSummary });
+				const seqId = tools.length;
 				try {
 					const ran = await runTool(s, call.name, args, bridgeVersion);
 					tools.push(ran.event);
-					if (ran.card)
+					if (ran.card) {
 						cards.push(ran.card);
+						emit({ type: 'card', card: ran.card });
+					}
 					if (ran.gotoSettings)
 						gotoSettings = true;
+					emit({ type: 'tool_end', seqId, event: ran.event });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson(ran.result),
@@ -559,7 +642,9 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 				}
 				catch (e) {
 					const msg = e instanceof Error ? e.message : String(e);
-					tools.push({ name: call.name, argsSummary: '', status: 'err', error: msg });
+					const errEvent: ChatToolEvent = { name: call.name, argsSummary: '', status: 'err', error: msg };
+					tools.push(errEvent);
+					emit({ type: 'tool_end', seqId, event: errEvent });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson({ ok: false, error: msg }),
@@ -569,20 +654,24 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 				}
 			}
 		}
-		return {
+		const capped: ChatTurnResult = {
 			assistantText: '本轮工具调用次数已达上限。你可以再发一条消息继续，或直接在确认卡上操作。',
 			tools,
 			cards,
 			gotoSettings,
 			llmConfigured: true,
 		};
+		emit({ type: 'final', result: capped });
+		return capped;
 	}
 	catch (e) {
+		if (signal.aborted)
+			return abortedResult();
 		const { kind, message } = classifyLlmError(e);
 		const goto = kind === 'auth' || kind === 'path' || kind === 'unconfigured' || kind === 'permission';
 		// llm.request 伪工具事件已移除：出站 HTTP 是插件行为而非模型工具调用，
 		// 失败信息经 assistantText 恢复话术与 error 字段呈现。
-		return {
+		const failed: ChatTurnResult = {
 			assistantText: recoverySpeech(kind, message),
 			tools,
 			cards,
@@ -590,6 +679,32 @@ export async function chatTurn(sessionId: string, userText: string, bridgeVersio
 			llmConfigured: true,
 			error: { kind, message, gotoSettings: goto },
 		};
+		emit({ type: 'final', result: failed });
+		return failed;
+	}
+	finally {
+		releaseAbort(sessionId);
+	}
+}
+
+/** tool_start 的参数摘要：与各工具 event.argsSummary 的口径保持一致（轻量，不发敏感内容）。 */
+function summarizeToolArgs(name: string, args: Record<string, unknown>): string {
+	switch (name) {
+		case 'get_catalog':
+			return args.force === true ? 'force 刷新' : '按设置中的库范围';
+		case 'self_check':
+			return '宿主 API 面';
+		case 'goto_settings':
+			return '切到设置';
+		case 'inspect_module':
+		case 'propose_edit':
+			return String(args.cbbUuid || '(待解析)');
+		case 'propose_placement':
+			return Array.isArray(args.picks) ? `${args.picks.length} 个候选` : '候选';
+		case 'propose_export':
+			return '导出确认卡';
+		default:
+			return '';
 	}
 }
 
