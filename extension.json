@@ -1,0 +1,47 @@
+{
+	"name": "jlc-cbb-copilot",
+	"uuid": "f3a9c2d84e6b47019a5d8c21e4b7f306",
+	"displayName": "复用模块智能助手",
+	"description": "嘉立创EDA专业版复用模块（CBB）对话助手。自然语言找模块、确认后放置、改描述、导出目录。",
+	"version": "0.6.0",
+	"publisher": "",
+	"engines": {
+		"eda": "^3.0.0"
+	},
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "extension-store",
+		"url": ""
+	},
+	"categories": "Schematic",
+	"keywords": [
+		"CBB",
+		"Reuse",
+		"AI",
+		"LLM",
+		"Library"
+	],
+	"images": {
+		"logo": "./images/logo.png"
+	},
+	"homepage": "",
+	"bugs": "",
+	"activationEvents": {},
+	"entry": "./dist/index",
+	"dependentExtensions": {},
+	"headerMenus": {
+		"sch": [
+			{
+				"id": "jlc-cbb-copilot",
+				"title": "CBB Copilot",
+				"menuItems": [
+					{
+						"id": "openCopilot",
+						"title": "Open CBB Copilot...",
+						"registerFn": "openCopilot"
+					}
+				]
+			}
+		]
+	}
+}

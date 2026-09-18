@@ -1,0 +1,34 @@
+{
+	"name": "jlc-cbb-copilot",
+	"version": "0.6.0",
+	"description": "嘉立创EDA专业版复用模块（CBB）对话助手",
+	"author": "",
+	"license": "Apache-2.0",
+	"homepage": "https://pro.lceda.cn/",
+	"engines": {
+		"node": ">=20.17.0"
+	},
+	"scripts": {
+		"compile": "rimraf ./dist/ && ts-node ./config/esbuild.prod.ts",
+		"lint": "eslint",
+		"fix": "eslint --fix",
+		"build": "npm run compile && ts-node ./build/packaged.ts"
+	},
+	"devDependencies": {
+		"@antfu/eslint-config": "^5.4.1",
+		"@jlceda/pro-api-types": "^0.3.6",
+		"@types/fs-extra": "^11.0.4",
+		"@types/react": "^18.3.31",
+		"esbuild": "^0.24.2",
+		"eslint": "^9.37.0",
+		"fs-extra": "^11.3.0",
+		"ignore": "^7.0.3",
+		"jszip": "^3.10.1",
+		"rimraf": "^6.0.1",
+		"ts-node": "^10.9.2",
+		"typescript": "^5.7.3"
+	},
+	"allowScripts": {
+		"esbuild@0.24.2": true
+	}
+}
