@@ -6,3 +6,6 @@
 /node_modules/
 /.eslintcache
 debug.log
+
+# ---------- Internal project docs (local only, do not publish) ----------
+/docs/
