@@ -61,11 +61,53 @@ export function classifyLlmError(e: unknown): { kind: LlmErrorKind; message: str
 	return { kind: 'other', message };
 }
 
-/** 会话中止注册表：sessionId → AbortController。chatTurn 开始时挂载，结束时卸载。 */
-const abortControllers = new Map<string, AbortController>();
+/**
+ * 最小中止信号：EasyEDA 扩展脚本环境无 AbortController 全局（真机报
+ * "AbortController is not a constructor"），用纯闭包实现等价接口（aborted / abort / 订阅）。
+ */
+export interface AbortSignalLike {
+	readonly aborted: boolean;
+	addEventListener: (type: 'abort', fn: () => void) => void;
+	removeEventListener: (type: 'abort', fn: () => void) => void;
+}
 
-export function registerAbort(sessionId: string): AbortController {
-	const c = new AbortController();
+export interface AbortControllerLike {
+	readonly signal: AbortSignalLike;
+	abort: () => void;
+}
+
+function createAbortController(): AbortControllerLike {
+	const listeners = new Set<() => void>();
+	let aborted = false;
+	const signal: AbortSignalLike = {
+		get aborted() {
+			return aborted;
+		},
+		addEventListener(_type, fn) {
+			listeners.add(fn);
+		},
+		removeEventListener(_type, fn) {
+			listeners.delete(fn);
+		},
+	};
+	return {
+		signal,
+		abort() {
+			if (aborted)
+				return;
+			aborted = true;
+			for (const fn of [...listeners])
+				fn();
+			listeners.clear();
+		},
+	};
+}
+
+/** 会话中止注册表：sessionId → controller。chatTurn 开始时挂载，结束时卸载。 */
+const abortControllers = new Map<string, AbortControllerLike>();
+
+export function registerAbort(sessionId: string): AbortControllerLike {
+	const c = createAbortController();
 	abortControllers.set(sessionId, c);
 	return c;
 }
@@ -82,7 +124,7 @@ export function abortSession(sessionId: string): boolean {
 	return true;
 }
 
-function sleepAbortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
+function sleepAbortable(ms: number, signal: AbortSignalLike | undefined): Promise<void> {
 	return new Promise((resolve) => {
 		const t = setTimeout(done, ms);
 		function done(): void {
@@ -90,8 +132,59 @@ function sleepAbortable(ms: number, signal: AbortSignal | undefined): Promise<vo
 			signal?.removeEventListener('abort', done);
 			resolve();
 		}
-		signal?.addEventListener('abort', done, { once: true });
+		signal?.addEventListener('abort', done);
 	});
+}
+
+/**
+ * 流式文本解码：TextDecoder 存在则用（正确处理跨 chunk 的多字节切分）；
+ * 缺失（与 AbortController 同类的环境限制）时按逐字节 UTF-8 解码兜底。
+ */
+function decodeChunk(decoder: TextDecoder | null, prevTail: Uint8Array | undefined, value: Uint8Array): { text: string; tail: Uint8Array | undefined } {
+	if (!decoder) {
+		// 简易 UTF-8：跳过被 chunk 边界截断的连续字节（尾部 <128 的 ASCII 正常解码）。
+		const bytes = prevTail ? new Uint8Array([...prevTail, ...value]) : value;
+		let end = bytes.length;
+		while (end > 0 && (bytes[end - 1] & 0xC0) === 0x80)
+			end--;
+		if (end > 0 && (bytes[end - 1] & 0x80) !== 0) {
+			// 尾字节是多字节序列的首字节，一并留到下个 chunk。
+			const tail = bytes.slice(end - 1);
+			return { text: utf8Decode(bytes.subarray(0, end - 1)), tail };
+		}
+		return { text: utf8Decode(bytes.subarray(0, end)), tail: undefined };
+	}
+	return { text: decoder.decode(value, { stream: true }), tail: undefined };
+}
+
+/** 极小 UTF-8 解码（无 TextDecoder 环境兜底）：仅覆盖 BMP 常用区。 */
+function utf8Decode(bytes: Uint8Array): string {
+	let out = '';
+	for (let i = 0; i < bytes.length;) {
+		const b0 = bytes[i]!;
+		if (b0 < 0x80) {
+			out += String.fromCharCode(b0);
+			i++;
+		}
+		else if ((b0 & 0xE0) === 0xC0 && i + 1 < bytes.length) {
+			out += String.fromCharCode(((b0 & 0x1F) << 6) | (bytes[i + 1]! & 0x3F));
+			i += 2;
+		}
+		else if ((b0 & 0xF0) === 0xE0 && i + 2 < bytes.length) {
+			out += String.fromCharCode(((b0 & 0x0F) << 12) | ((bytes[i + 1]! & 0x3F) << 6) | (bytes[i + 2]! & 0x3F));
+			i += 3;
+		}
+		else if ((b0 & 0xF8) === 0xF0 && i + 3 < bytes.length) {
+			const cp = ((b0 & 0x07) << 18) | ((bytes[i + 1]! & 0x3F) << 12) | ((bytes[i + 2]! & 0x3F) << 6) | (bytes[i + 3]! & 0x3F);
+			out += String.fromCharCode(0xD800 + ((cp - 0x10000) >> 10), 0xDC00 + ((cp - 0x10000) & 0x3FF));
+			i += 4;
+		}
+		else {
+			out += '\uFFFD';
+			i++;
+		}
+	}
+	return out;
 }
 
 /**
@@ -103,7 +196,7 @@ function sleepAbortable(ms: number, signal: AbortSignal | undefined): Promise<vo
 async function readSse(
 	res: { body?: { getReader?: () => { read: () => Promise<{ done: boolean; value?: Uint8Array }>; cancel?: () => Promise<void> } } },
 	handlers: StreamHandlers,
-	signal: AbortSignal,
+	signal: AbortSignalLike,
 ): Promise<'streamed' | 'buffered'> {
 	const reader = res.body && typeof res.body.getReader === 'function' ? res.body.getReader() : null;
 	if (!reader)
@@ -114,7 +207,8 @@ async function readSse(
 		}
 		catch { /* 已关闭 */ }
 	};
-	const decoder = new TextDecoder();
+	const decoder: TextDecoder | null = typeof TextDecoder !== 'undefined' ? new TextDecoder() : null;
+	let carry: Uint8Array | undefined;
 	let buf = '';
 	let events = 0;
 	let done = false;
@@ -142,7 +236,9 @@ async function readSse(
 			done = true;
 			break;
 		}
-		buf += decoder.decode(chunk.value, { stream: true });
+		const decoded = decodeChunk(decoder, carry, chunk.value ?? new Uint8Array());
+		carry = decoded.tail;
+		buf += decoded.text;
 		// 缓冲降级判定：累计超过阈值仍凑不出一个 SSE 事件行，说明通道不透传分块，
 		// 让调用方退回"整体缓冲 → 完整 JSON"解析（功能等价旧版非流式路径）。
 		if (events === 0 && buf.length > STREAM_FALLBACK_BYTES && !buf.includes('\n'))
@@ -174,7 +270,7 @@ async function readSse(
 /** 流式路径的返回哨兵：真实载荷已经过 onChunk 回调交付，Promise 值本身无意义。 */
 export const STREAM_SENTINEL = { __streamed: true };
 
-export async function sendLlmRequest(req: LlmRequest, handlers?: StreamHandlers, signal?: AbortSignal): Promise<unknown> {
+export async function sendLlmRequest(req: LlmRequest, handlers?: StreamHandlers, signal?: AbortSignalLike): Promise<unknown> {
 	const client = edaGlobal()?.sys_ClientUrl as
 		| { request?: (url: string, method: string, data?: string, options?: Record<string, unknown>) => Promise<unknown> }
 		| undefined;
@@ -223,7 +319,7 @@ export async function sendLlmRequest(req: LlmRequest, handlers?: StreamHandlers,
 		}
 		// 流式路径：SSE 分块读取；channel 不可流式（无 body reader 或整体缓冲）时降级为完整 JSON。
 		if (req.stream && handlers) {
-			const mode = await readSse(r, handlers, signal ?? new AbortController().signal);
+			const mode = await readSse(r, handlers, signal ?? createAbortController().signal);
 			if (mode === 'streamed')
 				return STREAM_SENTINEL;
 			// buffered：按完整 JSON 解析（通道缓冲或 body reader 不可用）。
