@@ -1,24 +1,27 @@
 /**
  * 对话编排：多轮 tool 循环 + 确认卡令牌。
- * 模型只能调用 propose_* / get_catalog / self_check / goto_settings；
+ * 模型只能调用 propose_* / search_modules / get_module / refresh_catalog / self_check；
  * 真正的放置/编辑/导出由 iframe 持令牌调用。
  */
-import type { CatalogFetchReport, CatalogJson, CatalogModule, CatalogStatsView } from '../catalog';
+import type { CatalogJson, CatalogStatsView } from '../catalog';
 import type { CachedGeometry, PlaceBox, PlaceMode, PlaceTarget, RegionStyle } from '../cbb';
 import type { HistoryTurn } from './llm';
 import type { AgentToolName } from './tools';
-import { fetchCatalog, pageSupportOf } from '../catalog';
+import type { CatalogStoreRecord, FlatModule } from './store';
+import { fetchCatalog } from '../catalog';
 import { activateSchematicPage, cacheGeometry, collectPageObstacles, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary } from '../cbb';
 import { effectiveLibraryScope, runSelfCheck } from '../env';
 import { exportProjectPackage } from '../pkg';
 import { getLlmSettings, getPlacementSettings } from '../settings';
 import { classifyLlmError, registerAbort, releaseAbort, sendLlmRequest, STREAM_SENTINEL } from './http';
 import { buildAgentRequest, buildPingRequest, parseAgentResponse, StreamAccumulator } from './llm';
-import { AGENT_TOOL_NAMES, buildAgentCatalogPayload, MAX_DESC_LEN } from './tools';
+import { AGENT_TOOL_NAMES, MAX_DESC_LEN } from './tools';
+import { buildCatalogSummaryPayload, clearCatalogRecord, EMPTY_CATALOG_NOTE, flattenCatalog, humanizeAge, loadCatalogRecord, lookupModule, memoryRecordIfLoaded, searchInCatalog, storeCatalog } from './store';
 
-const MAX_AGENT_ROUNDS = 4;
+/** 单条消息最多发起的模型调用轮数（每轮 = 思考 + 可选工具执行；工具结果驱动下一轮）。 */
+const MAX_AGENT_ROUNDS = 12;
 /** 单轮对话工具调用总量上限（Round ≠ Tool Call：模型一轮可返回多个调用，需独立限制防异常循环）。 */
-const MAX_TOOL_CALLS = 12;
+const MAX_TOOL_CALLS = 24;
 const MAX_HISTORY = 12;
 /** propose_placement 单卡最大候选数（与 schema maxItems 一致；网格批量放置的上限）。 */
 const MAX_PLACEMENT_PICKS = 20;
@@ -26,15 +29,17 @@ const MAX_PLACEMENT_PICKS = 20;
 /** Agent 事件流：chatTurn 执行过程中实时推给 UI 的所有事件。 */
 export type AgentEvent
 	/** 一条思维链增量（仅思考模式且端点返回时出现）。 */
-	= | { type: 'reasoning_delta'; delta: string }
+	= | { type: 'reasoning_delta'; delta: string; round: number }
 	/** 一条正文增量（流式模式）。 */
-		| { type: 'text_delta'; delta: string }
+		| { type: 'text_delta'; delta: string; round: number }
 	/** 模型发起一次工具调用（UI 立即显示"Running"状态）。 */
-		| { type: 'tool_start'; name: string; argsSummary: string }
+		| { type: 'tool_start'; name: string; argsSummary: string; round: number; args?: unknown }
 	/** 工具执行结束，与 tool_start 按 seqId 对应（UI 原位更新状态与结果）。 */
-		| { type: 'tool_end'; seqId: number; event: ChatToolEvent }
+		| { type: 'tool_end'; seqId: number; event: ChatToolEvent; round: number }
 	/** 提案确认卡生成（UI 立即渲染卡片，不等整轮结束）。 */
 		| { type: 'card'; card: ChatCardView }
+	/** 一个 agent 轮次结束（模型决定调工具 → 工具执行完毕，进入下一轮请求）。 */
+		| { type: 'round_end'; round: number }
 	/** 整轮结束的最终快照（含完整文本与状态，UI 用于对账）。 */
 		| { type: 'final'; result: ChatTurnResult };
 
@@ -51,6 +56,8 @@ export interface ChatToolEvent {
 	argsSummary: string;
 	status: 'ok' | 'err' | 'skip';
 	detail?: unknown;
+	/** 模型传入的真实参数（截断后），UI 展示用。 */
+	args?: unknown;
 	error?: string;
 }
 
@@ -146,8 +153,6 @@ interface CardRecord {
 
 interface ChatSession {
 	history: Array<HistoryTurn>;
-	catalog: CatalogJson | null;
-	catalogStats: CatalogStatsView | null;
 	cards: Map<string, CardRecord>;
 	/** 本会话内已成功做过原理图分析的模块 uuid（给编辑卡打"已分析"标记）。 */
 	analyzed: Set<string>;
@@ -158,7 +163,7 @@ const sessions = new Map<string, ChatSession>();
 function sessionOf(id: string): ChatSession {
 	let s = sessions.get(id);
 	if (!s) {
-		s = { history: [], catalog: null, catalogStats: null, cards: new Map(), analyzed: new Set() };
+		s = { history: [], cards: new Map(), analyzed: new Set() };
 		sessions.set(id, s);
 	}
 	return s;
@@ -195,39 +200,6 @@ function mergeStyleWithSettings(style?: RegionStyle): RegionStyle {
 	};
 }
 
-export function catalogStats(report: CatalogFetchReport): CatalogStatsView {
-	let emptyDesc = 0;
-	for (const lib of report.catalog.libraries) {
-		for (const m of lib.modules) {
-			if (!String(m.description || '').trim())
-				emptyDesc++;
-		}
-	}
-	return {
-		libraries: report.catalog.libraries.length,
-		modules: report.totalModules,
-		emptyDesc,
-		failed: report.failedLibraries,
-		elapsedMs: report.elapsedMs,
-	};
-}
-
-function flattenModules(catalog: CatalogJson): Array<CatalogModule & { libraryUuid: string; libraryKind: string; src: string; pageSupport: boolean }> {
-	const out: Array<CatalogModule & { libraryUuid: string; libraryKind: string; src: string; pageSupport: boolean }> = [];
-	for (const lib of catalog.libraries) {
-		for (const m of lib.modules) {
-			out.push({
-				...m,
-				libraryUuid: lib.libraryUuid,
-				libraryKind: lib.libraryKind,
-				src: lib.moduleName,
-				pageSupport: pageSupportOf(lib.libraryKind),
-			});
-		}
-	}
-	return out;
-}
-
 function invalidateOpenCards(s: ChatSession): void {
 	for (const rec of s.cards.values()) {
 		if (rec.status === 'open')
@@ -251,25 +223,26 @@ function settingsReady(): { ok: true } | { ok: false; missing: Array<string> } {
 	return missing.length ? { ok: false, missing } : { ok: true };
 }
 
-async function ensureCatalog(s: ChatSession, force: boolean): Promise<{ stats: CatalogStatsView; summary: string }> {
-	if (!force && s.catalog && s.catalogStats)
-		return { stats: s.catalogStats, summary: `使用会话目录快照：${s.catalogStats.modules} 个模块` };
+/**
+ * 确保目录记录可用：优先读持久化缓存（跨会话），缓存为空或 force 时拉取并落盘。
+ * 返回 summary 供工具结果与事件展示；force 时作废未处理确认卡。
+ */
+async function ensureCatalog(s: ChatSession, force: boolean): Promise<{ record: CatalogStoreRecord; summary: string }> {
+	if (!force) {
+		const cached = await loadCatalogRecord();
+		if (cached)
+			return { record: cached, summary: `使用持久化目录缓存：${cached.stats.modules} 个模块（${humanizeAge(Date.now() - cached.fetchedAt)}拉取）` };
+	}
 	const report = await fetchCatalog(await effectiveLibraryScope());
-	s.catalog = report.catalog;
-	s.catalogStats = catalogStats(report);
+	const stats = await storeCatalog(report);
 	if (force)
 		invalidateOpenCards(s);
-	const failed = report.catalog.libraries.filter(l => l.failed).map(l => `${l.moduleName}：${l.error}`).join('；');
+	const record = (await loadCatalogRecord())!;
+	const failed = record.catalog.libraries.filter(l => l.failed).map(l => `${l.moduleName}：${l.error}`).join('；');
 	const summary = failed
-		? `目录 ${s.catalogStats.modules} 个模块，失败库 ${s.catalogStats.failed}（${failed}）`
-		: `目录 ${s.catalogStats.modules} 个模块 / ${s.catalogStats.libraries} 库`;
-	return { stats: s.catalogStats, summary };
-}
-
-function lookupModule(s: ChatSession, cbbUuid: string) {
-	if (!s.catalog)
-		return null;
-	return flattenModules(s.catalog).find(m => m.uuid === cbbUuid) || null;
+		? `目录 ${stats.modules} 个模块，失败库 ${stats.failed}（${failed}）`
+		: `目录 ${stats.modules} 个模块 / ${stats.libraries} 库`;
+	return { record, summary };
 }
 
 function trimHistory(s: ChatSession): void {
@@ -301,6 +274,16 @@ function toolResultJson(value: unknown): string {
 	}
 }
 
+/** UI 展示用 JSON 截断：完整数据要给模型，给用户看的只保留开头防刷屏。 */
+const UI_JSON_PREVIEW_LEN = 600;
+
+function uiJsonPreview(value: unknown): string {
+	const text = toolResultJson(value);
+	if (text.length <= UI_JSON_PREVIEW_LEN)
+		return text;
+	return `${text.slice(0, UI_JSON_PREVIEW_LEN)}…（已截断，共 ${text.length} 字符）`;
+}
+
 interface ToolRunOutcome {
 	event: ChatToolEvent;
 	card?: ChatCardView;
@@ -309,11 +292,24 @@ interface ToolRunOutcome {
 }
 type ToolHandler = (s: ChatSession, args: Record<string, unknown>, bridgeVersion: string) => Promise<ToolRunOutcome>;
 
-/** 目录快照缺失时返回统一的错误结果，引导模型先调用 get_catalog——目录获取的唯一入口。 */
+/** 目录缓存为空时返回统一的错误结果，引导模型先调用 refresh_catalog。 */
 function missingCatalogOutcome(name: AgentToolName): ToolRunOutcome {
 	return {
-		event: { name, argsSummary: '缺少目录快照', status: 'err', error: '当前没有目录快照' },
-		result: { ok: false, error: '当前没有目录快照，请先调用 get_catalog 获取目录后再执行本工具。' },
+		event: { name, argsSummary: '目录缓存为空', status: 'err', error: '当前没有目录缓存' },
+		result: { ok: false, error: EMPTY_CATALOG_NOTE },
+	};
+}
+
+/** 检索结果 → 紧凑条目（给 LLM 看的最小字段集）。 */
+function compactHit(hit: { module: FlatModule }): Record<string, unknown> {
+	const m = hit.module;
+	return {
+		cbbUuid: m.uuid,
+		name: m.name,
+		classification: m.classification || [],
+		libraryKind: m.libraryKind,
+		pageSupport: m.pageSupport,
+		descBrief: (m.description || '').slice(0, 80) || undefined,
 	};
 }
 
@@ -323,12 +319,60 @@ function missingCatalogOutcome(name: AgentToolName): ToolRunOutcome {
  * 每个 handler 独立作用域，event.name 用字面量，避免与模块名等局部变量遮蔽。
  */
 const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
-	get_catalog: async (s, args) => {
-		const force = args.force === true;
-		const got = await ensureCatalog(s, force);
+	search_modules: async (_s, args) => {
+		const rec = await loadCatalogRecord();
+		if (!rec)
+			return missingCatalogOutcome('search_modules');
+		const query = typeof args.query === 'string' ? args.query : '';
+		const limit = Math.min(Math.max(typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : 10, 1), 30);
+		const hits = searchInCatalog(rec, query, limit);
 		return {
-			event: { name: 'get_catalog', argsSummary: force ? 'force 刷新' : '按设置中的库范围', status: 'ok', detail: got.stats },
-			result: { ok: true, stats: got.stats, catalog: buildAgentCatalogPayload(s.catalog!) },
+			event: { name: 'search_modules', argsSummary: query ? `“${query}”` : '浏览前若干条', status: 'ok', detail: { matched: hits.length, limit } },
+			result: {
+				ok: true,
+				matched: hits.length,
+				modules: hits.map(compactHit),
+				hint: hits.length ? '推荐/放置/编辑前用 get_module 获取目标模块完整详情；cbbUuid 必须逐字复制。' : '没有匹配模块。可换关键词重试，或提示用户把开源广场模块复制到个人库后 refresh_catalog。',
+			},
+		};
+	},
+	get_module: async (_s, args) => {
+		const rec = await loadCatalogRecord();
+		if (!rec)
+			return missingCatalogOutcome('get_module');
+		const cbbUuid = String(args.cbbUuid || '');
+		const hit = await lookupModule(cbbUuid);
+		if (!hit) {
+			return {
+				event: { name: 'get_module', argsSummary: cbbUuid || '(空)', status: 'err', error: '目录外 uuid' },
+				result: { ok: false, error: 'cbbUuid 不在当前目录缓存中。请用 search_modules 重新检索获取有效 uuid。' },
+			};
+		}
+		return {
+			event: { name: 'get_module', argsSummary: hit.name, status: 'ok' },
+			result: {
+				ok: true,
+				module: {
+					cbbUuid: hit.uuid,
+					libraryUuid: hit.libraryUuid,
+					name: hit.name,
+					description: hit.description || '',
+					classification: hit.classification || [],
+					boards: hit.boards || [],
+					storage: hit.storage,
+					localFilePath: hit.localFilePath,
+					localBackupDir: hit.localBackupDir,
+					libraryKind: hit.libraryKind,
+					pageSupport: hit.pageSupport,
+				},
+			},
+		};
+	},
+	refresh_catalog: async (s) => {
+		const got = await ensureCatalog(s, true);
+		return {
+			event: { name: 'refresh_catalog', argsSummary: '全量重拉并落盘', status: 'ok', detail: got.record.stats },
+			result: { ok: true, stats: got.record.stats, summary: got.summary },
 		};
 	},
 	self_check: async (_s, _args, bridgeVersion) => {
@@ -338,17 +382,11 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			result: { ok: true, text },
 		};
 	},
-	goto_settings: async () => {
-		return {
-			event: { name: 'goto_settings', argsSummary: '切到设置', status: 'ok' },
-			gotoSettings: true,
-			result: { ok: true },
-		};
-	},
 	propose_export: async (s) => {
-		if (!s.catalog)
+		const rec = await loadCatalogRecord();
+		if (!rec)
 			return missingCatalogOutcome('propose_export');
-		const picks: Array<ExportPickView> = flattenModules(s.catalog!).map(m => ({
+		const picks: Array<ExportPickView> = flattenCatalog(rec.catalog).map(m => ({
 			uuid: m.uuid,
 			name: m.name,
 			src: m.src,
@@ -357,7 +395,7 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 		}));
 		const token = newToken();
 		s.cards.set(token, { type: 'export', status: 'open', allowedUuids: new Set(picks.map(p => p.uuid)) });
-		const card: ExportCardView = { type: 'export', token, stats: s.catalogStats!, picks };
+		const card: ExportCardView = { type: 'export', token, stats: rec.stats, picks };
 		return {
 			event: { name: 'propose_export', argsSummary: `${card.stats.modules} 模块`, status: 'ok' },
 			card,
@@ -365,14 +403,15 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 		};
 	},
 	inspect_module: async (s, args) => {
-		if (!s.catalog)
+		const rec = await loadCatalogRecord();
+		if (!rec)
 			return missingCatalogOutcome('inspect_module');
 		const cbbUuid = String(args.cbbUuid || '');
-		const hit = lookupModule(s, cbbUuid);
+		const hit = await lookupModule(cbbUuid);
 		if (!hit) {
 			return {
 				event: { name: 'inspect_module', argsSummary: cbbUuid || '(空)', status: 'err', error: '目录外 uuid' },
-				result: { ok: false, error: 'cbbUuid 不在当前目录中' },
+				result: { ok: false, error: 'cbbUuid 不在当前目录缓存中。请用 search_modules 重新检索获取有效 uuid。' },
 			};
 		}
 		try {
@@ -402,14 +441,15 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 		}
 	},
 	propose_edit: async (s, args) => {
-		if (!s.catalog)
+		const rec = await loadCatalogRecord();
+		if (!rec)
 			return missingCatalogOutcome('propose_edit');
 		const cbbUuid = String(args.cbbUuid || '');
-		const hit = lookupModule(s, cbbUuid);
+		const hit = await lookupModule(cbbUuid);
 		if (!hit) {
 			return {
 				event: { name: 'propose_edit', argsSummary: cbbUuid || '(空)', status: 'err', error: '目录外 uuid' },
-				result: { ok: false, error: 'cbbUuid 不在当前目录中' },
+				result: { ok: false, error: 'cbbUuid 不在当前目录缓存中。请用 search_modules 重新检索获取有效 uuid。' },
 			};
 		}
 		// 运行时兜底校验：描述超长直接截断到与目录载荷一致的口径（prompt 只是行为引导，不是安全边界）。
@@ -436,14 +476,15 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 		};
 	},
 	propose_placement: async (s, args) => {
-		if (!s.catalog)
+		const rec = await loadCatalogRecord();
+		if (!rec)
 			return missingCatalogOutcome('propose_placement');
 		const raw = Array.isArray(args.picks) ? args.picks as Array<Record<string, unknown>> : [];
 		const filtered: Array<string> = [];
 		const picks: Array<PlacePickView> = [];
 		for (const it of raw.slice(0, MAX_PLACEMENT_PICKS)) {
 			const uuid = typeof it.cbbUuid === 'string' ? it.cbbUuid : '';
-			const hit = lookupModule(s, uuid);
+			const hit = await lookupModule(uuid);
 			if (!hit) {
 				filtered.push(`${String(it.name || uuid || '(空)')}（不在目录中）`);
 				continue;
@@ -553,7 +594,7 @@ export async function chatTurn(
 		};
 	}
 
-	// 目录获取完全由模型调用 get_catalog 驱动（提示词与上下文标注引导），插件不在循环外自动预取。
+	// 目录获取完全由模型调用 search_modules / refresh_catalog 驱动（提示词与上下文摘要引导），插件不在循环外自动预取。
 	s.history.push({ role: 'user', content: text });
 	trimHistory(s);
 
@@ -561,11 +602,13 @@ export async function chatTurn(
 		for (let round = 0; round < MAX_AGENT_ROUNDS; round++) {
 			if (signal.aborted)
 				return abortedResult();
-			// 每轮重建目录注入：get_catalog(force) 更新会话快照后旧注入必须作废，
-			// 否则同轮上下文里 system 是旧目录、observation 是新目录，模型会被两份目录打架。
-			const catalogNote = s.catalog
-				? `\n\n当前目录快照（JSON）：\n${buildAgentCatalogPayload(s.catalog)}`
-				: '\n\n当前没有可用目录快照。请先调用 get_catalog。';
+			// 每轮重建目录摘要注入：refresh_catalog 落盘后旧摘要必须作废，
+			// 否则同轮上下文里是旧统计、observation 是新统计，模型会被两份数据打架。
+			// 摘要仅含统计 + 各库计数 + 新鲜度（几百 token）；模块明细走 search_modules/get_module。
+			const catalogRecord = memoryRecordIfLoaded();
+			const catalogNote = catalogRecord
+				? `\n\n目录缓存摘要（模块明细不在上下文中，检索用 search_modules）：\n${buildCatalogSummaryPayload(catalogRecord)}`
+				: `\n\n${EMPTY_CATALOG_NOTE}`;
 			const settings = getLlmSettings();
 			const req = buildAgentRequest(settings, catalogNote, s.history);
 			req.stream = true;
@@ -576,9 +619,9 @@ export async function chatTurn(
 				onChunk: (chunk) => {
 					const { textDelta, reasoningDelta } = acc.feed(settings.provider, chunk);
 					if (reasoningDelta)
-						emit({ type: 'reasoning_delta', delta: reasoningDelta });
+						emit({ type: 'reasoning_delta', delta: reasoningDelta, round });
 					if (textDelta)
-						emit({ type: 'text_delta', delta: textDelta });
+						emit({ type: 'text_delta', delta: textDelta, round });
 				},
 			}, signal);
 			if (signal.aborted)
@@ -589,9 +632,9 @@ export async function chatTurn(
 			if (!streamed) {
 				// 缓冲路径没走过增量回调：整段一次性补发，UI 渲染口径与流式一致。
 				if (parsed.reasoning)
-					emit({ type: 'reasoning_delta', delta: parsed.reasoning });
+					emit({ type: 'reasoning_delta', delta: parsed.reasoning, round });
 				if (parsed.text)
-					emit({ type: 'text_delta', delta: parsed.text });
+					emit({ type: 'text_delta', delta: parsed.text, round });
 			}
 			if (!parsed.toolCalls.length) {
 				const assistantText = redactSecrets(parsed.text || '（模型没有返回文本）');
@@ -603,13 +646,22 @@ export async function chatTurn(
 			s.history.push({ role: 'assistant', content: parsed.text || '', toolCalls: parsed.toolCalls });
 			// 思维链属于过程信息，不进 history（避免污染下一轮上下文与 token 预算）。
 			for (const call of parsed.toolCalls) {
-				if (signal.aborted)
+				// 用户中止：补写占位工具结果，保持 assistant(tool_calls)/tool 成对，下一轮请求才合法。
+				if (signal.aborted) {
+					s.history.push({
+						role: 'tool',
+						content: toolResultJson({ ok: false, error: '用户中止了本轮回复' }),
+						toolCallId: call.id,
+						toolName: call.name,
+					});
 					return abortedResult();
+				}
+				const args = (call.arguments && typeof call.arguments === 'object' ? call.arguments : {}) as Record<string, unknown>;
 				if (toolCallCount >= MAX_TOOL_CALLS) {
-					const skipEvent: ChatToolEvent = { name: call.name, argsSummary: '已达调用总量上限', status: 'skip', error: '工具调用总量已达上限' };
+					const skipEvent: ChatToolEvent = { name: call.name, argsSummary: '已达调用总量上限', status: 'skip', error: '工具调用总量已达上限', args: uiJsonPreview(args) };
 					tools.push(skipEvent);
-					emit({ type: 'tool_start', name: call.name, argsSummary: '已达调用总量上限' });
-					emit({ type: 'tool_end', seqId: tools.length - 1, event: skipEvent });
+					emit({ type: 'tool_start', name: call.name, argsSummary: '已达调用总量上限', round, args: uiJsonPreview(args) });
+					emit({ type: 'tool_end', seqId: tools.length - 1, event: skipEvent, round });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson({ ok: false, error: '工具调用总量已达上限，请基于已有信息直接总结回复用户' }),
@@ -619,12 +671,23 @@ export async function chatTurn(
 					continue;
 				}
 				toolCallCount++;
-				const args = (call.arguments && typeof call.arguments === 'object' ? call.arguments : {}) as Record<string, unknown>;
 				const argsSummary = summarizeToolArgs(call.name, args);
-				emit({ type: 'tool_start', name: call.name, argsSummary });
+				emit({ type: 'tool_start', name: call.name, argsSummary, round, args: uiJsonPreview(args) });
 				const seqId = tools.length;
 				try {
-					const ran = await runTool(s, call.name, args, bridgeVersion);
+					// 工具内中止检查：长工具（refresh_catalog / inspect_module）执行完立即停下，不再发起下一轮。
+					const ran = signal.aborted ? null : await runTool(s, call.name, args, bridgeVersion);
+					if (!ran) {
+						tools.push({ name: call.name, argsSummary, status: 'skip', error: '用户中止', args: uiJsonPreview(args) });
+						s.history.push({
+							role: 'tool',
+							content: toolResultJson({ ok: false, error: '用户中止了本轮回复' }),
+							toolCallId: call.id,
+							toolName: call.name,
+						});
+						return abortedResult();
+					}
+					ran.event.args = uiJsonPreview(args);
 					tools.push(ran.event);
 					if (ran.card) {
 						cards.push(ran.card);
@@ -632,7 +695,7 @@ export async function chatTurn(
 					}
 					if (ran.gotoSettings)
 						gotoSettings = true;
-					emit({ type: 'tool_end', seqId, event: ran.event });
+					emit({ type: 'tool_end', seqId, event: ran.event, round });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson(ran.result),
@@ -642,9 +705,9 @@ export async function chatTurn(
 				}
 				catch (e) {
 					const msg = e instanceof Error ? e.message : String(e);
-					const errEvent: ChatToolEvent = { name: call.name, argsSummary: '', status: 'err', error: msg };
+					const errEvent: ChatToolEvent = { name: call.name, argsSummary: '', status: 'err', error: msg, args: uiJsonPreview(args) };
 					tools.push(errEvent);
-					emit({ type: 'tool_end', seqId, event: errEvent });
+					emit({ type: 'tool_end', seqId, event: errEvent, round });
 					s.history.push({
 						role: 'tool',
 						content: toolResultJson({ ok: false, error: msg }),
@@ -653,6 +716,8 @@ export async function chatTurn(
 					});
 				}
 			}
+			// 本轮工具全部执行完毕：通知 UI 轮次边界（下一轮请求即将发出，模型会重新思考）。
+			emit({ type: 'round_end', round });
 		}
 		const capped: ChatTurnResult = {
 			assistantText: '本轮工具调用次数已达上限。你可以再发一条消息继续，或直接在确认卡上操作。',
@@ -690,14 +755,15 @@ export async function chatTurn(
 /** tool_start 的参数摘要：与各工具 event.argsSummary 的口径保持一致（轻量，不发敏感内容）。 */
 function summarizeToolArgs(name: string, args: Record<string, unknown>): string {
 	switch (name) {
-		case 'get_catalog':
-			return args.force === true ? 'force 刷新' : '按设置中的库范围';
+		case 'search_modules':
+			return String(args.query || '').trim() ? `“${String(args.query).trim()}”` : '浏览目录';
+		case 'refresh_catalog':
+			return '全量重拉并落盘';
 		case 'self_check':
 			return '宿主 API 面';
-		case 'goto_settings':
-			return '切到设置';
 		case 'inspect_module':
 		case 'propose_edit':
+		case 'get_module':
 			return String(args.cbbUuid || '(待解析)');
 		case 'propose_placement':
 			return Array.isArray(args.picks) ? `${args.picks.length} 个候选` : '候选';
@@ -739,6 +805,11 @@ function requireCard(sessionId: string, token: string, type: CardRecord['type'])
 	return { session: s, card };
 }
 
+/** 仅取卡记录（不需要 session 的路径：如导出确认后置 done）。 */
+function requireCardRecord(sessionId: string, token: string): CardRecord | undefined {
+	return sessionOf(sessionId).cards.get(token);
+}
+
 export async function confirmPlace(
 	sessionId: string,
 	token: string,
@@ -756,19 +827,17 @@ export async function confirmPlace(
 			throw new Error(`模块 ${it.name || it.cbbUuid} 不在这张确认卡的提案中，请重新发起。`);
 	}
 	for (const it of items) {
-		if (!s.catalog)
-			throw new Error('目录快照已因写库操作失效，请重新发起放置（下一条消息会自动拉取最新目录）。');
-		const hit = lookupModule(s, it.cbbUuid);
+		const hit = await lookupModule(it.cbbUuid);
 		if (!hit || hit.libraryUuid !== it.libraryUuid)
-			throw new Error(`模块 ${it.name || it.cbbUuid} 不在当前目录中`);
-		if (it.mode === 'page' && !pageSupportOf(hit.libraryKind))
+			throw new Error(`模块 ${it.name || it.cbbUuid} 不在当前目录缓存中`);
+		if (it.mode === 'page' && !hit.pageSupport)
 			throw new Error(`${it.name} 所在库不支持复用模块图页放置`);
 	}
 	// 目录权威模块名（与 items 同序）：本地库图页放置按它定位 .eprj2（卡上的 it.name 可被用户改，不作文件定位键）。
-	const moduleNames = items.map((it) => {
-		const hit = s.catalog ? lookupModule(s, it.cbbUuid) : null;
+	const moduleNames = await Promise.all(items.map(async (it) => {
+		const hit = await lookupModule(it.cbbUuid);
 		return hit?.name || it.name;
-	});
+	}));
 	const origin = await getCurrentDocState();
 	const staysOnPage = (t: PlaceTarget) => t === 'current' || t === 'new';
 	const needsOrigin = items.some(it => staysOnPage(parsePlaceTarget(it.target)));
@@ -881,11 +950,10 @@ export async function confirmEdit(
 		const rec = s.cards.get(token);
 		if (rec)
 			rec.status = 'done';
-		// 写库成功后本会话目录快照立即失效：服务器端模块标识与内容都可能变化，
-		// 继续沿用旧快照提议放置会拿旧 uuid/旧信息，导致「编辑成功 → 同会话放置失败」。
-		// 置空后下一轮对话的预取会自动重拉最新目录（2026-09-16 真机回归发现）。
-		s.catalog = null;
-		s.catalogStats = null;
+		// 写库成功后持久化目录立即作废：服务器端模块标识与内容都可能变化，
+		// 继续沿用旧缓存提议放置会拿旧 uuid/旧信息，导致「编辑成功 → 同会话放置失败」。
+		// 清除后下一轮对话模型会先 refresh_catalog 重拉最新目录（2026-09-16 真机回归发现）。
+		await clearCatalogRecord();
 		// 模块内容已变，此前的原理图分析结论视为过期（uuid 若变化则旧键自然作废）。
 		s.analyzed.delete(proposal.cbbUuid);
 		return { ok: true };
@@ -896,7 +964,7 @@ export async function confirmEdit(
 }
 
 export async function confirmExport(sessionId: string, token: string, uuids: Array<string>): Promise<{ ok: boolean; stats?: CatalogStatsView; fileCount?: number; cloudCount?: number; fileName?: string; failed?: Array<{ name: string; error: string }>; error?: string }> {
-	const { session: s, card } = requireCard(sessionId, token, 'export');
+	const { card } = requireCard(sessionId, token, 'export');
 	if (!Array.isArray(uuids) || !uuids.length)
 		throw new Error('未勾选任何模块');
 	if (!card.allowedUuids)
@@ -906,17 +974,19 @@ export async function confirmExport(sessionId: string, token: string, uuids: Arr
 			throw new Error('导出清单与确认卡提案不一致，请重新发起。');
 	}
 	try {
-		// 复用卡上会话快照导出（与用户确认的内容同源，避免确认后���拉目录导致清单漂移）；
-		// 传入深拷贝，防止 pkg 内的过滤/回写污染会话状态；文件定位在导出时仍按磁盘实况执行。
-		const snapshot = s.catalog
-			? JSON.parse(JSON.stringify(s.catalog)) as CatalogJson
+		// 复用持久化目录导出（与用户确认的内容同源，避免确认后重拉目录导致清单漂移）；
+		// 传入深拷贝，防止 pkg 内的过滤/回写污染存储状态；文件定位在导出时仍按磁盘实况执行。
+		// 缓存为空时 pkg 回退为重新拉取（exportProjectPackage 内置该路径）。
+		const catalogRec = await loadCatalogRecord();
+		const snapshot = catalogRec
+			? JSON.parse(JSON.stringify(catalogRec.catalog)) as CatalogJson
 			: undefined;
 		const r = await exportProjectPackage(uuids, snapshot);
 		if (!r.ok && !r.cancelled)
 			throw new Error('导出失败');
-		const rec = s.cards.get(token);
-		if (rec && r.ok)
-			rec.status = 'done';
+		const cardRec = requireCardRecord(sessionId, token);
+		if (cardRec && r.ok)
+			cardRec.status = 'done';
 		return { ok: r.ok, stats: r.stats, fileCount: r.fileCount, cloudCount: r.cloudCount, fileName: r.fileName, failed: r.failed, error: r.cancelled ? '已取消' : undefined };
 	}
 	catch (e) {

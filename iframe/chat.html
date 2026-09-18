@@ -137,13 +137,8 @@
   .tool-line{display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none;
     color:var(--text-3); font-size:12.5px; line-height:1.4; padding:3px 0; width:100%;}
   .tool-line:hover{color:var(--text-2);}
-  .tool-spin{flex:none; width:12px; height:12px; display:none; color:var(--blue);}
-  .tool-spin svg{display:block; width:12px; height:12px; overflow:visible;}
-  .tool.running .tool-spin{display:block;}
-  .tool.running .tool-spin svg{animation:tool-rotate .9s linear infinite;}
   .tool.running .tool-label{animation:tool-pulse 1.4s ease-in-out infinite;}
   .tool.running .tool-line{color:var(--text-2);}
-  @keyframes tool-rotate{to{transform:rotate(360deg);}}
   @keyframes tool-pulse{0%,100%{opacity:1;}50%{opacity:.45;}}
   /* ── 思维链（reasoning）折叠块：默认展开跟随流出，结束后自动收起 ── */
   .tool.reasoning{cursor:pointer;}
@@ -151,11 +146,6 @@
   .tool.reasoning .tool-label{font-style:normal;}
   .reasoning-stream{display:none; padding:2px 0 4px 19px; color:var(--text-3); font-size:12.5px; line-height:1.55; white-space:pre-wrap; word-break:break-word;}
   .tool.reasoning.open .reasoning-stream{display:block;}
-  .tool.reasoning.streaming .reasoning-stream{display:block;}
-  .tool.reasoning.streaming .tool-spin{display:block;}
-  .tool.reasoning.streaming .tool-spin svg{animation:tool-rotate .9s linear infinite;}
-  .tool.reasoning.streaming .tool-line .tool-caret{transform:rotate(90deg);}
-  .tool.reasoning.streaming .tool-label{animation:tool-pulse 1.4s ease-in-out infinite;}
   .tool-line .tool-label{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   /* 整轮计时组：展开显示本轮工具行，收起隐藏 */
   .tool .tool-sub{display:none; flex-direction:column; padding-left:19px;}
@@ -515,7 +505,7 @@
   async function mockEmitText(text, speed) {
     for (let i = 0; i < text.length; i += speed) {
       if (mockAborted) return false;
-      mockEventHandler?.({ type: 'text_delta', delta: text.slice(i, i + speed) });
+      mockEventHandler?.({ type: 'text_delta', delta: text.slice(i, i + speed), round: 0 });
       await sleep(24);
     }
     return !mockAborted;
@@ -555,11 +545,11 @@
       mockAborted = false;
       const ev = (x) => { if (!mockAborted) mockEventHandler?.(x); };
       const runTool = async (name, argsSummary, detail, ms) => {
-        ev({ type: 'tool_start', name, argsSummary });
+        ev({ type: 'tool_start', name, argsSummary, round: 0, args: { mock: name } });
         await sleep(ms || 500);
         if (mockAborted) return null;
         const event = { name, argsSummary, status: 'ok', detail };
-        ev({ type: 'tool_end', seqId: 0, event });
+        ev({ type: 'tool_end', seqId: 0, event, round: 0 });
         return event;
       };
       const finish = async (text, extra) => {
@@ -571,7 +561,7 @@
       const cards = [];
       if (mockAborted) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
       if (!mockCatalog) {
-        const tool = await runTool('get_catalog', '会话首次拉取', MOCK_CATALOG.stats, 600);
+        const tool = await runTool('search_modules', '浏览目录', MOCK_CATALOG.stats, 600);
         if (!tool) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
         tools.push(tool);
         mockCatalog = MOCK_CATALOG;
@@ -613,7 +603,7 @@
       }
       if (/(刷新|重新拉).*(目录|列表)|目录.*(刷新)|^(有|列)(哪|什么)|有哪些?模块|模块列表|^目录$/.test(t)) {
         mockCatalog = MOCK_CATALOG;
-        const tool = await runTool('get_catalog', 'force 刷新', MOCK_CATALOG.stats, 400);
+        const tool = await runTool('refresh_catalog', '全量重拉并落盘', MOCK_CATALOG.stats, 400);
         if (!tool) return { assistantText: '（已停止）', tools, cards, llmConfigured: true, error: { kind: 'aborted', message: '用户中止', gotoSettings: false } };
         tools.push(tool);
         return await finish(`目录已刷新，共 ${MOCK_MODULES.length} 个模块：\n\n| 库 | 模块数 | 能力 |\n|---|---|---|\n| 个人库（云端） | ${MOCK_MODULES.filter(m => m.libraryKind === 'personal').length} | 目录 / 符号 / 图页 / 编辑 |\n| 本地库 | ${MOCK_MODULES.filter(m => m.libraryKind === 'local').length} | 目录 / 符号 / 编辑，**不支持图页** |\n\n${mockCatalog.stats.emptyDesc ? '⚠ 有 1 个模块**描述为空**，会影响匹配质量，需要我帮你补写吗？' : '要我列出某一类模块吗？'}`);
@@ -917,10 +907,9 @@
   /* 整轮工作计时（从消息发出起算）：运行中「⟳ Working for Xs」（旋转+闪烁），
      结束「Worked for Xs」；展开显示本轮各工具行，收起时不���示 */
   function addWorkTimer() {
-    const el = document.createElement('div'); el.className = 'tool work running'; /* 默认收起 */
+    const el = document.createElement('div'); el.className = 'tool work running open';
     el.innerHTML = `
       <div class="tool-line">
-        <span class="tool-spin" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M7 1.5A5.5 5.5 0 1 1 1.5 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span>
         <span class="tool-label"></span>
         <span class="tool-caret" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       </div>
@@ -951,15 +940,23 @@
     (parentEl || ensureSeg()).appendChild(el);
     const label = el.querySelector('.tool-label');
     const detail = el.querySelector('.tool-detail');
+    let argsText = argsSummary || '';
+    let argsJson = '';
     function fill(payload) {
       const parts = [];
-      if (argsSummary) parts.push(String(argsSummary));
-      if (payload !== undefined) parts.push(typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2));
+      if (argsText) parts.push(argsText);
+      if (argsJson) parts.push(`入参: ${argsJson}`);
+      if (payload !== undefined) parts.push(`结果: ${typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)}`);
       detail.textContent = parts.join('\n');
     }
     scrollBottom();
     if (argsSummary) detail.textContent = String(argsSummary); /* 运行中即可展开看参数 */
     return {
+      /* 模型真实入参（后端截断后的 JSON 文本），tool_start 后立即展示 */
+      setArgs(args) {
+        argsJson = typeof args === 'string' ? args : JSON.stringify(args, null, 2);
+        detail.textContent = [argsText, argsJson ? `入参: ${argsJson}` : ''].filter(Boolean).join('\n');
+      },
       done(detailData) {
         el.classList.add('ok');
         label.textContent = `${name} · completed`;
@@ -980,13 +977,12 @@
       },
     };
   }
-  /* ── 思维链折叠块：流式期间展开跟随，完成 1.2s 后自动收起；点击行切换展开 ── */
+  /* ── 思维链折叠块：流式期间展开跟随，完成后自动收起；点击行切换展开 ── */
   function addReasoningBlock(parentEl) {
     const el = document.createElement('div'); el.className = 'tool reasoning streaming open';
     el.innerHTML = `
       <div class="tool-line">
-        <span class="tool-spin" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M7 1.5A5.5 5.5 0 1 1 1.5 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></span>
-        <span class="tool-label">思考中…</span>
+        <span class="tool-label">Thinking</span>
         <span class="tool-caret" aria-hidden="true"><svg viewBox="0 0 14 14" fill="none"><path d="M5 3.5 L9 7 L5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
       </div>
       <div class="reasoning-stream"></div>`;
@@ -1002,13 +998,13 @@
         stream.textContent = text;
         scrollBottom();
       },
-      /* 结束：label 定格，稍后收起（用户已手动展开则保持展开） */
+      /* 结束：label 定格为 Thought，稍后自动收起（用户手动操作过则维持其选择）。
+         幂等：轮次边界 / 工具开始 / 整轮结束多处触发，只生效一次。 */
       done() {
+        if (!el.classList.contains('streaming')) return;
         el.classList.remove('streaming');
-        label.textContent = '思考过程';
-        if (settleTimer) clearTimeout(settleTimer);
+        label.textContent = 'Thought';
         settleTimer = setTimeout(() => {
-          if (el.classList.contains('streaming')) return;
           if (!el.dataset.userToggled) el.classList.remove('open');
         }, 1200);
       },
@@ -1255,13 +1251,29 @@
     return currentAi;
   }
 
+  /* 每轮独立渲染上下文：agent 多轮调用（思考→工具→再思考）在 UI 上按轮分段，
+     轮次边界可见，不再把所有轮次拼进同一个思考块/气泡。 */
+  let currentRound = -1;
+
+  function ensureRoundContext(round) {
+    if (currentRound === round) return;
+    /* 进入新一轮 = 上一轮的思考已结束：把上一轮 Thinking 定格为 Thought */
+    if (currentReasoning) currentReasoning.done();
+    currentRound = round;
+    currentReasoning = null;
+    currentAi = null;
+    /* liveTools 不重置：后端 seqId 按整轮全局递增，前端数组必须与之一一对应 */
+  }
+
   function handleAgentEvent(ev) {
     if (ev.type === 'reasoning_delta') {
+      ensureRoundContext(ev.round);
       if (!currentReasoning) currentReasoning = addReasoningBlock(workBody());
       currentReasoning.append(ev.delta);
       return;
     }
     if (ev.type === 'text_delta') {
+      ensureRoundContext(ev.round);
       const b = ensureAiBubble();
       b.text += ev.delta;
       b.el.innerHTML = mdRich(b.text);
@@ -1269,8 +1281,12 @@
       return;
     }
     if (ev.type === 'tool_start') {
-      /* tool_start 与 tool_end 通过数组下标（seqId）对位 */
+      ensureRoundContext(ev.round);
+      /* 模型发起工具调用 = 本轮思考结束：定格 Thinking → Thought */
+      if (currentReasoning) currentReasoning.done();
+      /* tool_start 与 tool_end 通过数组下标（seqId）对位；args = 模型真实入参 JSON */
       const tb = addToolBubble(ev.name, ev.argsSummary || '', workBody());
+      if (ev.args !== undefined) tb.setArgs(ev.args);
       liveTools.push(tb);
       return;
     }
@@ -1278,9 +1294,14 @@
       const tb = liveTools[ev.seqId];
       if (!tb) return;
       const t = ev.event;
+      /* detail = 工具真实执行结果 JSON（后端已截断）；失败时展示 error + 参数 */
       if (t.status === 'ok') tb.done(t.detail);
       else if (t.status === 'skip') tb.skip(t.error || '已跳过');
       else tb.fail(t.error || '失败', t.detail);
+      return;
+    }
+    if (ev.type === 'round_end') {
+      ensureRoundContext(ev.round);
       return;
     }
     if (ev.type === 'card') {
@@ -1290,7 +1311,7 @@
     if (ev.type === 'final') {
       /* final 快照对账：卡片失效由目录刷新检测驱动；正文/工具已实时渲染，不再重画 */
       const res = ev.result;
-      if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
+      if ((res.tools || []).some(x => x.name === 'refresh_catalog'))
         invalidateCards('目录已更新');
       if (res.error && res.error.kind === 'aborted') {
         if (currentAi && !currentAi.text) { currentAi.el.innerHTML = '<i>（已停止）</i>'; }
@@ -1322,7 +1343,7 @@
     addUserMsg(t);
     markCardsRisk();
     currentWork = addWorkTimer();
-    currentAi = null; currentReasoning = null; liveTools = [];
+    currentAi = null; currentReasoning = null; liveTools = []; currentRound = -1;
     try {
       if (typeof bridge.onAgentEvent === 'function') {
         bridge.onAgentEvent(SESSION_ID, handleAgentEvent);
@@ -1330,7 +1351,7 @@
       } else {
         /* 旧桥（无事件通道）：退回整批渲染 */
         const res = await bridge.chatTurn(SESSION_ID, t);
-        if ((res.tools || []).some(x => x.name === 'get_catalog' && /force|刷新/.test(x.argsSummary || '')))
+        if ((res.tools || []).some(x => x.name === 'refresh_catalog'))
           invalidateCards('目录已更新');
         renderTools(res.tools, work.body);
         await streamAi(res.assistantText || '', 3);
@@ -1347,7 +1368,7 @@
     setSendAsStop(false);
     syncSendState();
     currentWork.done();
-    currentAi = null; currentReasoning = null; liveTools = [];
+    currentAi = null; currentReasoning = null; liveTools = []; currentRound = -1;
   }
 
   function switchTab(name) {
@@ -1363,10 +1384,13 @@
 
   const CHIP_PROMPTS = ['现在有哪些模块？', '找一个电源模块并放置', '帮我把模块描述写规范', '导出复用模块工程和索引json'];
   CHIP_PROMPTS.forEach(c => { /* 空会话首屏（#chips，居中换行）与对话中建议条（#chipsBar，横滑）共用同一组选项 */
-    const b = document.createElement('div'); b.className = 'chip'; b.textContent = c;
-    b.onclick = () => handleUser(c);
-    $('#chips').appendChild(b);
-    $('#chipsBar').appendChild(b.cloneNode(true));
+    /* 注意：cloneNode 不复制事件监听器，两处必须各自绑定 onclick（此前 chipsBar 的克隆节点不可点击） */
+    const b1 = document.createElement('div'); b1.className = 'chip'; b1.textContent = c;
+    b1.onclick = () => handleUser(c);
+    $('#chips').appendChild(b1);
+    const b2 = document.createElement('div'); b2.className = 'chip'; b2.textContent = c;
+    b2.onclick = () => handleUser(c);
+    $('#chipsBar').appendChild(b2);
   });
   /* 建议条滚轮横滑：滚轮增量优先横向滚动本栏（始终精确到 0 / max，不会截断），
      超出部分转交上方消息区，避免边缘死区与对话流误滚 */
