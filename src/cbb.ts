@@ -1234,7 +1234,13 @@ export interface SelectionPart {
 	designator?: string;
 	/** 库器件名：回库查器件对象的唯一依据（不能用元件自带 uuid，那是工程内副本）。 */
 	deviceName: string;
+	/**
+	 * 元件自带的 libraryUuid。★ 实测多为**工程 uuid**（工程内副本库），不能拿它当库去搜——
+	 * 那样会搜到同名副本而非真库器件。仅作兜底，正常走 resolveDeviceItem 的库优先顺序。
+	 */
 	libraryUuid: string;
+	/** 元件所用符号名：用于在多个同名候选中挑出符号一致的那个（保形状）。 */
+	symbolName?: string;
 	subPartName?: string;
 	x: number;
 	y: number;
@@ -1322,33 +1328,26 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 	if (!state.ok)
 		throw new Error('当前活动文档不是原理图页。请先切换到原理图页并选中要存成模块的内容。');
 	const sel = edaGlobal()?.sch_SelectControl as
-		| { getAllSelectedPrimitives_PrimitiveId?: () => Promise<Array<string> | undefined> }
+		| { getAllSelectedPrimitives?: () => Promise<Array<Record<string, unknown>>> }
 		| undefined;
-	if (typeof sel?.getAllSelectedPrimitives_PrimitiveId !== 'function')
-		throw new Error('sch_SelectControl.getAllSelectedPrimitives_PrimitiveId 不可用（宿主版本过低或不支持）');
-	let ids: Array<string> = [];
+	if (typeof sel?.getAllSelectedPrimitives !== 'function')
+		throw new Error('sch_SelectControl.getAllSelectedPrimitives 不可用（宿主版本过低或不支持）');
+	// ★ 必须用 getAllSelectedPrimitives 直接取对象，**不能**用 sch_Primitive.getPrimitivesByPrimitiveId：
+	// 实测（V4.1.71）后者只返回元件，**走线一条都不返回**，用它读选区会永远拿不到走线。
+	// 本 API 同时给出元件与走线对象，且两者的 getState_* 与属性面都可用。
+	// 走线以**分段**形式出现：一条折线拆成若干段，每段仍带自己的 line/net/color/lineWidth/lineType，
+	// 逐段重建与原折线等价。
+	let objs: Array<Record<string, unknown>> = [];
 	try {
-		ids = (await withTimeout(sel.getAllSelectedPrimitives_PrimitiveId(), 15000, '读取选区超时')) || [];
+		objs = (await withTimeout(sel.getAllSelectedPrimitives(), 15000, '读取选区超时')) || [];
 	}
 	catch (e) {
 		throw new Error(`读取选区失败：${fmtErr(e)}`);
 	}
-	ids = ids.filter(id => typeof id === 'string' && id);
-	if (!ids.length)
+	objs = (Array.isArray(objs) ? objs : []).filter(o => o && typeof o === 'object');
+	if (!objs.length)
 		return emptySnapshot();
-
-	const prim = edaGlobal()?.sch_Primitive as
-		| { getPrimitivesByPrimitiveId?: (ids: Array<string>) => Promise<Array<Record<string, unknown>>> }
-		| undefined;
-	if (typeof prim?.getPrimitivesByPrimitiveId !== 'function')
-		throw new Error('sch_Primitive.getPrimitivesByPrimitiveId 不可用（宿主版本过低或不支持）');
-	let objs: Array<Record<string, unknown>> = [];
-	try {
-		objs = (await withTimeout(prim.getPrimitivesByPrimitiveId(ids), 15000, '读取选中图元超时')) || [];
-	}
-	catch (e) {
-		throw new Error(`读取选中图元失败：${fmtErr(e)}`);
-	}
+	const ids = objs.map(o => (typeof o.primitiveId === 'string' ? o.primitiveId : '')).filter(Boolean);
 
 	const snap = emptySnapshot();
 	snap.primitiveIds = ids;
@@ -1372,14 +1371,27 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 			const comp = read(o, 'getState_Component') as { name?: unknown; libraryUuid?: unknown } | undefined;
 			const cName = comp && typeof comp.name === 'string' ? comp.name : '';
 			const libUuid = comp && typeof comp.libraryUuid === 'string' ? comp.libraryUuid : '';
+			// 符号名做「多个同名器件」的择优依据。实测选区的 getState_Symbol() 常拿不到 name，
+			// 故属性面也试一次；都拿不到就是 undefined（不影响主流程，只是少一个择优条件）。
+			const symByFn = read(o, 'getState_Symbol') as { name?: unknown } | undefined;
+			const symByProp = o.symbol as { name?: unknown } | undefined;
+			const symbolName = (symByFn && typeof symByFn.name === 'string' && symByFn.name)
+				|| (symByProp && typeof symByProp.name === 'string' && symByProp.name)
+				|| undefined;
 			const at = { x: num(read(o, 'getState_X')), y: num(read(o, 'getState_Y')), rotation: num(read(o, 'getState_Rotation')), mirror: read(o, 'getState_Mirror') === true };
-			const net = typeof read(o, 'getState_Net') === 'string' ? String(read(o, 'getState_Net')) : '';
+			// ★ 网络名的取法按类型不同（V4.1.71 实测）：走线对象 getState_Net() 正常；
+			// netflag/netport 对象上 getState_Net() 返回**空串**，网络名在 getState_Name() 里
+			// （'GND' / '5V' / 'ENC_2'）。两者都试，先 Net 后 Name。
+			const netRaw = read(o, 'getState_Net');
+			const nameRaw = read(o, 'getState_Name');
+			const net = (typeof netRaw === 'string' && netRaw) ? netRaw : (typeof nameRaw === 'string' ? nameRaw : '');
 			if (cType === 'part') {
 				const sub = read(o, 'getState_SubPartName');
 				snap.parts.push({
 					designator: typeof read(o, 'getState_Designator') === 'string' ? String(read(o, 'getState_Designator')) : undefined,
 					deviceName: cName,
 					libraryUuid: libUuid,
+					symbolName,
 					subPartName: typeof sub === 'string' && sub ? sub : undefined,
 					...at,
 				});
@@ -1427,7 +1439,8 @@ export function assertSelectionSize(snap: SelectionSnapshot): void {
  * 实测 search 会返回模糊命中的其它器件（如搜 'Res_0603' 首条是 'YFT0603X103F3950FA'），
  * 不精确匹配就会建出错件。找不到返回 null（调用方计入失败清单）。
  */
-async function resolveDeviceItem(deviceName: string, libraryUuid: string): Promise<Record<string, unknown> | null> {
+async function resolveDeviceItem(part: SelectionPart): Promise<Record<string, unknown> | null> {
+	const deviceName = part.deviceName;
 	if (!deviceName)
 		return null;
 	const dev = edaGlobal()?.lib_Device as
@@ -1435,14 +1448,37 @@ async function resolveDeviceItem(deviceName: string, libraryUuid: string): Promi
 		| undefined;
 	if (typeof dev?.search !== 'function')
 		return null;
+
+	// ★ 库优先顺序：系统库（不传 libraryUuid = 系统库）→ 个人库 → 元件自带库。
+	// 实测（V4.1.71）元件自带的 libraryUuid 多数是**当前工程 uuid**（工程内副本库），
+	// 拿它搜会搜到同名**工程内副本**而非真库器件；而副本不能跨工程解析，拿去建模块会
+	// 形状对不上或建不出来。所以真库器件优先，元件自带库只作最后兜底。
+	const libs: Array<string | undefined> = [undefined];
 	try {
-		const rows = await withTimeout(dev.search(deviceName, libraryUuid), DEVICE_LOOKUP_TIMEOUT_MS, '查找器件超时');
-		const hit = (Array.isArray(rows) ? rows : []).find(r => String(r?.name ?? '') === deviceName);
-		return hit || null;
+		const libsApi = edaGlobal()?.lib_LibrariesList as { getPersonalLibraryUuid?: () => Promise<string | undefined> } | undefined;
+		const personal = typeof libsApi?.getPersonalLibraryUuid === 'function' ? await libsApi.getPersonalLibraryUuid() : undefined;
+		if (typeof personal === 'string' && personal)
+			libs.push(personal);
 	}
-	catch {
-		return null;
+	catch { /* 个人库拿不到就跳过 */ }
+	if (part.libraryUuid && !libs.includes(part.libraryUuid))
+		libs.push(part.libraryUuid);
+
+	for (const lib of libs) {
+		try {
+			const rows = await withTimeout(dev.search(deviceName, lib), DEVICE_LOOKUP_TIMEOUT_MS, '查找器件超时');
+			const exact = (Array.isArray(rows) ? rows : []).filter(r => String(r?.name ?? '') === deviceName);
+			if (!exact.length)
+				continue;
+			// 同名多条时优先符号名一致的那个（保形状）；拿不到符号名则取首个。
+			const bySymbol = part.symbolName
+				? exact.find(r => String(r?.symbolName ?? '') === part.symbolName)
+				: undefined;
+			return bySymbol || exact[0];
+		}
+		catch { /* 该库搜不到就试下一个 */ }
 	}
+	return null;
 }
 
 export interface CreateCbbModuleParams {
@@ -1621,9 +1657,9 @@ async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>
 	const before = (await countPageContent()).comps;
 	for (const p of parts) {
 		const label = p.designator || p.deviceName || '(未命名器件)';
-		const dev = await resolveDeviceItem(p.deviceName, p.libraryUuid);
+		const dev = await resolveDeviceItem(p);
 		if (!dev) {
-			failures.push(`器件 ${label}：库中找不到名为「${p.deviceName}」的器件`);
+			failures.push(`器件 ${label}：系统库/个人库中找不到名为「${p.deviceName}」的器件`);
 			continue;
 		}
 		try {
