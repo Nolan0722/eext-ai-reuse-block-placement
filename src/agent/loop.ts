@@ -340,14 +340,19 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			return missingCatalogOutcome('search_modules');
 		const query = typeof args.query === 'string' ? args.query : '';
 		const limit = Math.min(Math.max(typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : 10, 1), 30);
-		const hits = searchInCatalog(rec, query, limit);
+		const { hits, relaxed } = searchInCatalog(rec, query, limit);
 		return {
-			event: { name: 'search_modules', argsSummary: query ? `“${query}”` : '浏览前若干条', status: 'ok', detail: { matched: hits.length, limit } },
+			event: { name: 'search_modules', argsSummary: query ? `“${query}”` : '浏览前若干条', status: 'ok', detail: { matched: hits.length, limit, relaxed: relaxed || undefined } },
 			result: {
 				ok: true,
 				matched: hits.length,
+				relaxed: relaxed || undefined,
 				modules: hits.map(compactHit),
-				hint: hits.length ? '推荐/放置/编辑前用 get_module 获取目标模块完整详情；cbbUuid 必须逐字复制。' : await noMatchHint(),
+				hint: hits.length
+					? (relaxed
+							? '这一批是放宽匹配的结果（没有模块同时命中全部关键词，按命中词数排序）。若用户要的更精确，请换更贴近模块名称的词重搜，或改用 recommend_modules 按功能描述语义推荐。推荐/放置/编辑前用 get_module 获取目标模块完整详情；cbbUuid 必须逐字复制。'
+							: '推荐/放置/编辑前用 get_module 获取目标模块完整详情；cbbUuid 必须逐字复制。')
+					: await noMatchHint(),
 			},
 		};
 	},

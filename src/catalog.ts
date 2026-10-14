@@ -222,6 +222,8 @@ async function fetchLibraryModules(uuid: string): Promise<Array<CatalogModule>> 
 				description: String(row.description ?? ''),
 				// storage 在 fetchCatalog 中按库类型正确标记；此处先给占位默认
 				storage: 'cloud',
+				// search 行的 classification 实测恒为空数组（V4.1.71），真值由 fetchModuleDetail 的
+				// get 回填；这里保留读取是为了宿主将来若开始返回时不丢数据。
 				classification: Array.isArray(row.classification) ? row.classification.map(String) : undefined,
 				updateTimestamp: typeof row.updateTimestamp === 'number' ? row.updateTimestamp : undefined,
 				ascription: typeof row.ascription === 'string' ? row.ascription : undefined,
@@ -233,8 +235,21 @@ async function fetchLibraryModules(uuid: string): Promise<Array<CatalogModule>> 
 	return modules;
 }
 
-/** 读模块工程结构（boards 含 schematic/pcb/parentProjectUuid），失败返回 null 不阻塞。 */
-async function fetchModuleBoards(cbbUuid: string, libraryUuid: string): Promise<Array<CatalogModuleBoard> | null> {
+/** get() 单次取回的模块详情：工程结构 + 分类。 */
+interface ModuleDetail {
+	boards: Array<CatalogModuleBoard>;
+	classification: Array<string>;
+}
+
+/**
+ * 读模块详情（boards 含 schematic/pcb/parentProjectUuid + classification），失败返回 null 不阻塞。
+ *
+ * 分类必须从这里取、不能从 search 取（2026-10-14 V4.1.71 实测）：`search` 返回的每一行
+ * classification 恒为 `[]`（官方库 40 个模块、个人库、团队库全部为空，连名字与次分类同名的
+ * 模块也是空），而 `get` 返回真实分类路径数组，如 `["树莓派系列最小系统","树莓派紧凑型号"]`。
+ * 目录拉取本就为拿图页 uuid 逐模块调 get，接上分类不增加任何请求。
+ */
+async function fetchModuleDetail(cbbUuid: string, libraryUuid: string): Promise<ModuleDetail | null> {
 	const cbb = edaGlobal()?.lib_Cbb as Record<string, unknown> | undefined;
 	const get = cbb?.get as ((cbbUuid: string, libraryUuid?: string) => Promise<Record<string, unknown> | undefined>) | undefined;
 	if (typeof get !== 'function')
@@ -243,19 +258,24 @@ async function fetchModuleBoards(cbbUuid: string, libraryUuid: string): Promise<
 		// 15s 超时与放置路径（cbb.getCbbPageUuid）同口径：本地模块 get() 已知崩溃/挂起，
 		// 目录拉取逐模块调它，不能只靠 catch——挂起会卡住整轮 fetchCatalog。
 		const detail = await withTimeout(get.call(cbb, cbbUuid, libraryUuid), 15000, '获取模块详情超时');
-		const boards = Array.isArray(detail?.boards) ? detail.boards as Array<Record<string, unknown>> : [];
-		if (!boards.length)
+		if (!detail || typeof detail !== 'object')
 			return null;
-		return boards.map(b => ({
-			itemType: String(b.itemType ?? 'Board'),
-			name: String(b.name ?? ''),
-			schematic: typeof b.schematic === 'string' && b.schematic ? b.schematic : undefined,
-			pcb: typeof b.pcb === 'string' && b.pcb ? b.pcb : undefined,
-			parentProjectUuid: typeof b.parentProjectUuid === 'string' && b.parentProjectUuid ? b.parentProjectUuid : undefined,
-		}));
+		const rawBoards = Array.isArray(detail.boards) ? detail.boards as Array<Record<string, unknown>> : [];
+		return {
+			boards: rawBoards.map(b => ({
+				itemType: String(b.itemType ?? 'Board'),
+				name: String(b.name ?? ''),
+				schematic: typeof b.schematic === 'string' && b.schematic ? b.schematic : undefined,
+				pcb: typeof b.pcb === 'string' && b.pcb ? b.pcb : undefined,
+				parentProjectUuid: typeof b.parentProjectUuid === 'string' && b.parentProjectUuid ? b.parentProjectUuid : undefined,
+			})),
+			classification: Array.isArray(detail.classification)
+				? detail.classification.map(String).map(s => s.trim()).filter(Boolean)
+				: [],
+		};
 	}
 	catch {
-		// 本地库 get() 已知崩溃（SPEC §7.3）；工程库副本拒绝——静默降级为无 boards
+		// 本地库 get() 已知崩溃（SPEC §7.3）；工程库副本拒绝——静默降级为无 boards/无分类
 		return null;
 	}
 }
@@ -297,11 +317,16 @@ export async function fetchCatalog(scope: Partial<LibraryScope>): Promise<Catalo
 		}
 		try {
 			const modules = await fetchLibraryModules(lib.uuid);
-			// boards 每模块一次 lib_Cbb.get（数百 ms），只取图页放置需要的 schematic uuid。
+			// 每模块一次 lib_Cbb.get（数百 ms）：取图页放置用的 schematic uuid，并顺带接上分类
+			// （分类真值只在 get 里，search 恒返回空——见 fetchModuleDetail 注释）。
 			for (const m of modules) {
-				const boards = await fetchModuleBoards(m.uuid, lib.uuid);
-				if (boards)
-					m.boards = boards;
+				const detail = await fetchModuleDetail(m.uuid, lib.uuid);
+				if (detail) {
+					if (detail.boards.length)
+						m.boards = detail.boards;
+					if (detail.classification.length)
+						m.classification = detail.classification;
+				}
 				m.storage = lib.kind === 'local' ? 'local' : 'cloud';
 			}
 			libraries.push({

@@ -665,46 +665,65 @@ export async function lookupModule(cbbUuid: string): Promise<FlatModule | null> 
 	return flattenCatalog(rec.catalog).find(m => m.uuid === cbbUuid) || null;
 }
 
+/** 单词命中得分：名称前缀 > 名称包含 > 分类包含 > 描述包含。 */
+function tokenScore(token: string, name: string, cls: string, desc: string): number {
+	if (name.startsWith(token))
+		return 6;
+	if (name.includes(token))
+		return 4;
+	if (cls.includes(token))
+		return 3;
+	if (desc.includes(token))
+		return 1;
+	return 0;
+}
+
 /**
  * 关键词检索：空格分词、逐词 AND；评分 = 名称命中 > 分类命中 > 描述命中，前缀加成。
  * 空查询返回按库序的前 limit 条（浏览用）。
+ *
+ * 两段式（回退段为 2026-10-14 新增）：严格 AND 有结果就只返回严格结果；
+ * 一个都没有时放宽为「命中至少一个词」，按命中词数优先、总分次之排序。
+ * 此前只有严格段，多词需求少命中一个词就直接空手而归（如「3.3V LDO 低功耗」
+ * 而模块只写了其中两个词）。relaxed=true 表示这批是放宽结果，供上层提示换词再试。
+ *
+ * 分类维度的有效性取决于目录数据：classification 真值来自 lib_Cbb.get（见 catalog.ts
+ * fetchModuleDetail），search 行里恒为空。get 不可达的库（本地库崩溃）分类仍为空，
+ * 此时该维度自然不参与打分。
  */
-export function searchInCatalog(rec: CatalogStoreRecord, query: string, limit: number): Array<{ module: FlatModule; score: number }> {
+export function searchInCatalog(rec: CatalogStoreRecord, query: string, limit: number): { hits: Array<{ module: FlatModule; score: number }>; relaxed: boolean } {
 	const flat = flattenCatalog(rec.catalog);
-	const q = (query || '').trim().toLowerCase();
-	const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
-	const scored: Array<{ module: FlatModule; score: number }> = [];
+	const tokens = (query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+	if (!tokens.length)
+		return { hits: flat.slice(0, limit).map(module => ({ module, score: 0 })), relaxed: false };
+
+	const strict: Array<{ module: FlatModule; score: number }> = [];
+	const loose: Array<{ module: FlatModule; score: number; hit: number }> = [];
 	for (const m of flat) {
-		if (!tokens.length) {
-			scored.push({ module: m, score: 0 });
-			continue;
-		}
 		const name = (m.name || '').toLowerCase();
 		const desc = (m.description || '').toLowerCase();
 		const cls = (m.classification || []).join(' ').toLowerCase();
 		let total = 0;
-		let matchedAll = true;
+		let hit = 0;
 		for (const t of tokens) {
-			let s = 0;
-			if (name.startsWith(t))
-				s = 6;
-			else if (name.includes(t))
-				s = 4;
-			else if (cls.includes(t))
-				s = 3;
-			else if (desc.includes(t))
-				s = 1;
-			if (!s) {
-				matchedAll = false;
-				break;
-			}
+			const s = tokenScore(t, name, cls, desc);
+			if (s)
+				hit++;
 			total += s;
 		}
-		if (matchedAll && total > 0)
-			scored.push({ module: m, score: total });
+		if (!hit)
+			continue;
+		if (hit === tokens.length)
+			strict.push({ module: m, score: total });
+		else
+			loose.push({ module: m, score: total, hit });
 	}
-	scored.sort((a, b) => b.score - a.score);
-	return scored.slice(0, limit);
+	if (strict.length) {
+		strict.sort((a, b) => b.score - a.score);
+		return { hits: strict.slice(0, limit), relaxed: false };
+	}
+	loose.sort((a, b) => b.hit - a.hit || b.score - a.score);
+	return { hits: loose.slice(0, limit).map(({ module, score }) => ({ module, score })), relaxed: loose.length > 0 };
 }
 
 // ── 新鲜度提示（供 system 注入的统计摘要） ───────────────────────────
@@ -746,6 +765,29 @@ export async function hiddenLibraryBriefs(): Promise<Array<HiddenLibraryBrief>> 
 		}));
 }
 
+/** 分类摘要最多列几条（控制注入体积）。 */
+const CLASS_SUMMARY_MAX = 12;
+
+/**
+ * 目录里的分类分布：分类是路径数组（如 ["树莓派系列最小系统","树莓派紧凑型号"]），
+ * 用 / 连接成一条完整路径，按模块数降序取前 N 条。
+ * 数据来自 lib_Cbb.get（见 catalog.ts fetchModuleDetail）；get 不可达的库贡献为空。
+ */
+function classificationBrief(catalog: CatalogJson): Array<{ name: string; modules: number }> {
+	const counts = new Map<string, number>();
+	for (const lib of catalog.libraries) {
+		for (const m of lib.modules) {
+			const path = (m.classification || []).map(s => String(s).trim()).filter(Boolean).join('/');
+			if (path)
+				counts.set(path, (counts.get(path) || 0) + 1);
+		}
+	}
+	return [...counts.entries()]
+		.map(([name, modules]) => ({ name, modules }))
+		.sort((a, b) => b.modules - a.modules || a.name.localeCompare(b.name))
+		.slice(0, CLASS_SUMMARY_MAX);
+}
+
 export function buildCatalogSummaryPayload(rec: CatalogStoreRecord, hidden: Array<HiddenLibraryBrief> = []): string {
 	const perLib = rec.catalog.libraries.map(l => ({
 		kind: l.libraryKind,
@@ -754,6 +796,7 @@ export function buildCatalogSummaryPayload(rec: CatalogStoreRecord, hidden: Arra
 		failed: l.failed || undefined,
 		error: l.failed ? (l.error || '拉取失败') : undefined,
 	}));
+	const classes = classificationBrief(rec.catalog);
 	const ageMs = Math.max(0, Date.now() - rec.fetchedAt);
 	const hiddenLibraries = hidden.length ? hidden : undefined;
 	return JSON.stringify({
@@ -764,6 +807,11 @@ export function buildCatalogSummaryPayload(rec: CatalogStoreRecord, hidden: Arra
 		stale: ageMs > STALE_HINT_MS || undefined,
 		staleHint: ageMs > STALE_HINT_MS ? '目录数据较旧，若用户关心最新模块可调用 refresh_catalog' : undefined,
 		libraries: perLib,
+		// 分类是路径（父/子）；模型可直接拿它当 search_modules 的关键词，用于「按类别找模块」类需求。
+		classifications: classes.length ? classes : undefined,
+		classificationHint: classes.length
+			? 'classifications 是各库现有分类（路径用 / 连接，父在前）。用户按类别找模块时，可把分类名当关键词传给 search_modules——分类参与检索打分。'
+			: undefined,
 		hiddenLibraries,
 		visibilityHint: hiddenLibraries
 			? '这些库已经在本地目录里，只是用户关闭了对你的可见范围，所以检索结果里没有。找不到模块时，请用户打开设置里的「模块库目录」，勾选对应库并点「保存可见范围」。不要为此调用 refresh_catalog，也不要建议重新拉取、导入或复制模块。'

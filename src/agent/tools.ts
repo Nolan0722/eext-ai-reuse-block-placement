@@ -170,7 +170,7 @@ const COMPACT_HISTORY_PARAMS = {
  * 受类型穷尽约束——新增工具只需在本表登记一处，漏实现会得到编译错误。
  */
 export const AGENT_TOOLS = [
-	{ name: 'search_modules', description: '按关键词检索复用模块目录（个人库 + 团队库 + 本地库）。空格分词逐词 AND，匹配名称/分类/描述；返回紧凑条目（uuid/名称/分类/库类型）。适合模块名、型号、器件名等精确关键词。空 query 返回前若干条，用于用户明确要求浏览目录时。需求是否已经具体到可以调用，按系统提示【系统提示词】判断。', parameters: SEARCH_MODULES_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'search_modules', description: '按关键词检索复用模块目录（个人库 + 团队库 + 本地库）。空格分词逐词 AND，匹配名称/分类/描述（分类来自模块自身的分类路径，可把系统提示里 classifications 的分类名当关键词用）；返回紧凑条目（uuid/名称/分类/库类型）。适合模块名、型号、器件名、分类名等精确关键词。若没有模块同时命中全部关键词，会自动放宽为部分匹配并在结果里标 relaxed:true——此时按命中词数排序，可提示用户换更贴近模块名的词，或改用 recommend_modules。空 query 返回前若干条，用于用户明确要求浏览目录时。需求是否已经具体到可以调用，按系统提示【系统提示词】判断。', parameters: SEARCH_MODULES_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'recommend_modules', description: 'Jev 语义推荐：语义检索+排序流水线——预设分类（缓存）→ 类别筛选 → 类内全量 0-10 打分 → 放置意图判定，返回按 jevScore 排序的明细。适合已经包含具体功能参数的描述，query 传用户原始需求整句；精确型号/模块名改用 search_modules。用户明确要求放置时本工具才可能自动出示放置确认卡；否则返回明细不出卡。需求是否已经具体到可以调用，按系统提示【系统提示词】判断。', parameters: RECOMMEND_MODULES_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'get_module', description: '读取单个模块的完整详情：名称、描述、分类、boards（自带原理图/PCB uuid）、云端/本地存储标记。cbbUuid 必须来自 search_modules。', parameters: GET_MODULE_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'refresh_catalog', description: '重新拉取全部库的模块目录并落盘持久化（首次约 20 秒，库大时可能数分钟）。上下文中的目录摘要标注数据较旧（stale）或用户明确要求刷新时调用；其余情况用 search_modules 即可。调用本工具的同一条回复中，先用正文告诉用户「拉取数据可能需要数分钟，请您耐心等待」，再发起调用。', parameters: REFRESH_CATALOG_PARAMS as unknown as Record<string, unknown> },
