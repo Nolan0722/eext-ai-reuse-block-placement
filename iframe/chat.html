@@ -781,6 +781,12 @@
       await sleep(700);
       return { ok: true, fileName: 'cbb-catalog-mock.json', stats: MOCK_CATALOG.stats };
     },
+    async confirmCreateModule(_sid, token) {
+      if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
+      mockOpenTokens.delete(token);
+      await sleep(900);
+      return { ok: true, cbbUuid: 'mock-cbb-uuid', name: '演示模块', libraryLabel: '个人库', rebuilt: { parts: 3, wires: 2, netFlags: 1, netPorts: 0 } };
+    },
     cancelCard(_sid, token) { mockOpenTokens.delete(token); },
     resetChatSession() { mockOpenTokens.clear(); },
     async selfCheck() {
@@ -1446,11 +1452,82 @@
     };
   }
 
+  function addCreateModuleCard(card) {
+    const s = card.summary || {};
+    const libs = card.libraries || [];
+    const counts = [];
+    if (s.parts) counts.push(`${s.parts} 个器件`);
+    if (s.wires) counts.push(`${s.wires} 条走线`);
+    if (s.netFlags) counts.push(`${s.netFlags} 个网络标志`);
+    if (s.netPorts) counts.push(`${s.netPorts} 个网络端口`);
+    const chips = [];
+    if ((s.designators || []).length) chips.push('位号 ' + (s.designators || []).map(esc).join('、'));
+    if ((s.nets || []).length) chips.push('网络 ' + (s.nets || []).map(esc).join('、'));
+    const inputStyle = 'width:100%; padding:6px 9px; border:1px solid var(--line); border-radius:7px; font:12.5px/1.5 inherit; font-family:inherit; background:var(--panel); color:var(--text); outline:none;';
+    const labelStyle = 'display:block; font-size:11.5px; color:var(--text-3); margin:9px 0 3px;';
+    const options = libs.map(l => `<option value="${esc(l.key)}"${l.default ? ' selected' : ''}>${esc(l.label)}${l.kind === 'team' ? '（团队可见）' : ''}</option>`).join('');
+    const skipped = (s.unsupported || []).length
+      ? `<div class="hint">选区里有 ${(s.unsupported || []).length} 类图元不会写入模块：${esc((s.unsupported || []).join('、'))}</div>`
+      : '';
+    const el = cardShell({
+      title: '新建复用模块确认',
+      bodyHTML: `<div class="pick-item" style="display:block">
+          <div class="pi-title">将写入：${esc(counts.length ? counts.join(' · ') : '（无）')}</div>
+          ${chips.length ? `<div class="pi-reason">${chips.join('　')}</div>` : ''}
+          <label style="${labelStyle}">模块名称</label>
+          <input type="text" class="cm-name" value="${esc(card.name || '')}" maxlength="60" style="${inputStyle}">
+          <label style="${labelStyle}">模块描述</label>
+          <textarea class="cm-desc" style="${inputStyle} min-height:84px; resize:vertical;">${esc(card.description || '')}</textarea>
+          <label style="${labelStyle}">写入库</label>
+          <select class="cm-lib" style="${inputStyle}">${options}</select>
+          <div class="hint cm-teamnote" style="display:${card.teamVisible ? 'block' : 'none'}">目标库是团队库，写入后<strong>团队成员可见</strong>。</div>
+          ${skipped}
+          <div class="hint">确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。切换期间请勿操作编辑器。</div>
+        </div>`,
+      footHTML: `<button class="btn primary act-create">创建模块</button><span class="spacer"></span><button class="btn act-cancel">取消</button>`,
+    });
+    const libSel = el.querySelector('.cm-lib');
+    libSel.onchange = () => {
+      const l = libs[libSel.selectedIndex] || {};
+      el.querySelector('.cm-teamnote').style.display = l.kind === 'team' ? 'block' : 'none';
+    };
+    el.querySelector('.act-cancel').onclick = () => {
+      el.classList.add('dead'); el.classList.remove('open'); liveCards.splice(liveCards.indexOf(el), 1);
+      try { bridge.cancelCard(SESSION_ID, card.token); } catch (e) {}
+      addNote('已取消创建模块');
+    };
+    el.querySelector('.act-create').onclick = async () => {
+      if (busy) return;
+      const name = el.querySelector('.cm-name').value.trim();
+      if (!name) { addNote('模块名称不能为空'); return; }
+      busy = true;
+      const description = el.querySelector('.cm-desc').value;
+      const libraryKey = libSel.value;
+      el.classList.add('done'); el.classList.remove('open'); liveCards.splice(liveCards.indexOf(el), 1);
+      const tb = addToolBubble('create_module', name);
+      try {
+        const res = await bridge.confirmCreateModule(SESSION_ID, card.token, { name, description, libraryKey });
+        if (res.ok) {
+          tb.done(res); busy = false;
+          const r = res.rebuilt || {};
+          const detail = `器件 ${r.parts || 0} · 走线 ${r.wires || 0} · 网络标志 ${r.netFlags || 0} · 网络端口 ${r.netPorts || 0}`;
+          let msg = `复用模块 **${res.name}** 已写入${res.libraryLabel ? `「${res.libraryLabel}」` : '目标库'}（${detail}）。请到库面板**刷新后**查看——面板不会自动出现新模块。`;
+          if ((res.failures || []).length) msg += `\n\n有 ${res.failures.length} 项未能重建：\n${res.failures.map(f => `- ${f}`).join('\n')}`;
+          await streamAi(msg, 3);
+        }
+        else { tb.fail(res.error || '创建失败'); busy = false; await streamAi('创建模块失败：' + (res.error || '未知原因'), 3); }
+      } catch (e) {
+        tb.fail(e.message || String(e)); busy = false;
+      }
+    };
+  }
+
   function renderCards(cards) {
     (cards || []).forEach(c => {
       if (c.type === 'place') addPlaceCard(c);
       else if (c.type === 'edit') addEditCard(c);
       else if (c.type === 'export') addExportCard(c);
+      else if (c.type === 'create_module') addCreateModuleCard(c);
     });
   }
   function renderTools(tools, body) {

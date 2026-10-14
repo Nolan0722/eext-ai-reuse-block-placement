@@ -258,6 +258,14 @@ export async function runSelfCheck(bridgeVersion: string): Promise<string> {
 	lines.push(mark(probeFn(e, 'lib_Cbb.search'), 'lib_Cbb.search', '目录拉取（分页 1 起）'));
 	lines.push(mark(probeFn(e, 'lib_Cbb.get'), 'lib_Cbb.get', '复用模块图页取图页 uuid（云端模块；本地模块会崩溃，改走 .eprj2 解析）'));
 	lines.push(mark(probeFn(e, 'lib_Cbb.modify'), 'lib_Cbb.modify', '模块名称/描述写回'));
+	lines.push(mark(probeFn(e, 'lib_Cbb.create'), 'lib_Cbb.create', '新建复用模块（需 V4.1.71+；旧版静默返回 undefined）'));
+	lines.push(mark(probeFn(e, 'lib_Cbb.openProjectInEditor'), 'openProjectInEditor', '打开模块工程（建模块时写内容用；会切走当前工程）'));
+	lines.push(mark(probeFn(e, 'sch_SelectControl.getAllSelectedPrimitives_PrimitiveId'), 'getSelectedPrimitives', '读画布选区（建模块的输入）'));
+	lines.push(mark(probeFn(e, 'sch_Primitive.getPrimitivesByPrimitiveId'), 'getPrimitivesByPrimitiveId', '按 id 取选中图元对象'));
+	lines.push(mark(probeFn(e, 'lib_Device.search'), 'lib_Device.search', '按器件名回库查器件（重建元件用）'));
+	lines.push(mark(probeFn(e, 'sch_PrimitiveWire.create'), 'PrimitiveWire.create', '走线重建'));
+	lines.push(mark(probeFn(e, 'sch_PrimitiveComponent.createNetFlag'), 'createNetFlag', '网络标志重建'));
+	lines.push(mark(probeFn(e, 'sch_PrimitiveComponent.createNetPort'), 'createNetPort', '网络端口重建'));
 	lines.push(mark(probeFn(e, 'sch_PrimitiveComponent.createCbbSymbol'), 'createCbbSymbol', '复用模块符号放置'));
 	lines.push(mark(probeFn(e, 'sch_PrimitiveComponent.placeCbbSchematicPage'), 'placeCbbSchematicPage', '复用模块图页放置（落到当前活动图页）'));
 	lines.push(mark(probeFn(e, 'dmt_Schematic.createSchematicPage'), 'createSchematicPage', '新建图页'));

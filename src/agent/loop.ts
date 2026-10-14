@@ -3,12 +3,13 @@
  * 模型只能调用 propose_* / search_modules / get_module / refresh_catalog / self_check；
  * 真正的放置/编辑/导出由 iframe 持令牌调用。
  */
-import type { CatalogJson, CatalogStatsView } from '../catalog';
-import type { CachedGeometry, PlaceBox, PlaceMode, PlaceTarget, RegionStyle } from '../cbb';
+import type { CatalogJson, CatalogStatsView, WritableLibrary } from '../catalog';
+import type { CachedGeometry, PlaceBox, PlaceMode, PlaceTarget, RegionStyle, SelectionSnapshot } from '../cbb';
 import type { HistoryTurn } from './llm';
 import type { CatalogStoreRecord, FlatModule } from './store';
 import type { AgentToolName } from './tools';
-import { activateSchematicPage, cacheGeometry, collectPageObstacles, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary } from '../cbb';
+import { listWritableLibraries } from '../catalog';
+import { activateSchematicPage, assertSelectionSize, cacheGeometry, collectPageObstacles, createCbbModuleFromSelection, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary, readSelectionSnapshot, SELECTION_DESIGNATOR_LIMIT } from '../cbb';
 import { runSelfCheck } from '../env';
 import { edaGlobal } from '../host';
 import { getJevSettings, getLlmSettings, getPlacementSettings, getStylePrompt } from '../settings';
@@ -115,7 +116,43 @@ export interface ExportCardView {
 	picks: Array<ExportPickView>;
 }
 
-export type ChatCardView = PlaceCardView | EditCardView | ExportCardView;
+/** 目标库候选项。key 是服务端不透明键：confirm 只回传它，uuid 由服务端按 key 解析，客户端无法指定任意库。 */
+export interface CreateModuleLibraryView {
+	key: string;
+	label: string;
+	kind: 'personal' | 'team';
+	default?: boolean;
+}
+
+/** 选区只读回显：让用户看清「将要写入什么」。 */
+export interface CreateModuleSummaryView {
+	parts: number;
+	wires: number;
+	netFlags: number;
+	netPorts: number;
+	/** 器件位号（超出上限只给计数，不逐个列）。 */
+	designators: Array<string>;
+	/** 选区涉及的网络名。 */
+	nets: Array<string>;
+	/** 被跳过、不会写入模块的图元类型（文字/图形等）。 */
+	unsupported: Array<string>;
+}
+
+export interface CreateModuleCardView {
+	type: 'create_module';
+	token: string;
+	/** AI 建议名，卡上可改。 */
+	name: string;
+	/** AI 建议描述，卡上可改。 */
+	description: string;
+	classification: Array<string>;
+	summary: CreateModuleSummaryView;
+	libraries: Array<CreateModuleLibraryView>;
+	/** 目标库为团队库时置 true，卡上显示「团队成员可见」警示。 */
+	teamVisible: boolean;
+}
+
+export type ChatCardView = PlaceCardView | EditCardView | ExportCardView | CreateModuleCardView;
 
 export type { CatalogStatsView };
 
@@ -147,12 +184,25 @@ export interface PlaceCbbItem {
  * 而非「持卡可对目录里任意模块执行一次」。
  */
 interface CardRecord {
-	type: 'place' | 'edit' | 'export';
+	type: 'place' | 'edit' | 'export' | 'create_module';
 	status: 'open' | 'done' | 'dead';
 	/** edit 提案：身份字段不可变；confirm 只接受用户可编辑的 name/description。 */
 	edit?: { libraryUuid: string; cbbUuid: string; name: string; description: string };
 	/** place/export 提案：允许勾选的 uuid 全集（= 卡上 picks），提交范围必须是它的子集。 */
 	allowedUuids?: Set<string>;
+	/**
+	 * create_module 提案：选区快照与目标库候选都以卡为准。
+	 * 目标库只绑不透明 key——用户可在卡上换库，但 uuid 一律由服务端按 key 解析，
+	 * 客户端无法指定任意 uuid（与 edit 卡「身份字段以卡为准」同一套授权语义）。
+	 */
+	createModule?: {
+		snapshot: SelectionSnapshot;
+		name: string;
+		description: string;
+		classification: Array<string>;
+		libraries: Map<string, WritableLibrary>;
+		defaultKey: string;
+	};
 }
 
 interface ChatSession {
@@ -644,6 +694,90 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			result: { ok: true, token, name: card.name, hint: '已出示编辑确认卡，等待用户确认后才会写库' },
 		};
 	},
+	propose_create_module: async (s, args) => {
+		// 只读：读画布选区 + 目标库候选。两者都不依赖目录缓存——目录可能为空或过期，
+		// 而「把选中的存成模块」不该要求用户先拉一遍目录。
+		const fail = (error: string, argsSummary: string): ToolRunOutcome => ({
+			event: { name: 'propose_create_module', argsSummary, status: 'err', error },
+			result: { ok: false, error },
+		});
+		const label = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : '(未命名)';
+		let snapshot: SelectionSnapshot;
+		try {
+			snapshot = await readSelectionSnapshot();
+		}
+		catch (e) {
+			return fail(e instanceof Error ? e.message : String(e), label);
+		}
+		if (!snapshot.primitiveIds.length)
+			return fail('当前画布没有选中的内容。请提示用户在原理图上选中要存成模块的元件/走线后再试。', label);
+		try {
+			assertSelectionSize(snapshot);
+		}
+		catch (e) {
+			return fail(e instanceof Error ? e.message : String(e), label);
+		}
+		const total = snapshot.parts.length + snapshot.wires.length + snapshot.netFlags.length + snapshot.netPorts.length;
+		if (!total)
+			return fail('选中的内容里没有可写入模块的图元（页框等不会被写入）。请提示用户改选元件、走线、网络标志或网络端口。', label);
+
+		const libraries = await listWritableLibraries();
+		if (!libraries.length) {
+			return fail('当前环境没有可写入的云库（个人库/团队库）。离线或半离线模式下创建模块不可用——请提示用户切换到在线版客户端。', label);
+		}
+
+		// 目标库候选：uuid 只留在服务端，卡上只给不透明 key。
+		const libMap = new Map<string, WritableLibrary>();
+		const libViews: Array<CreateModuleLibraryView> = libraries.map((l, i) => {
+			const key = `lib_${i}`;
+			libMap.set(key, l);
+			return { key, label: l.label || (l.kind === 'personal' ? '个人库' : '团队库'), kind: l.kind };
+		});
+		const wanted = args.libraryKind === 'team' ? 'team' : 'personal';
+		const picked = libViews.find(v => v.kind === wanted) || libViews[0];
+		picked.default = true;
+
+		const name = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : '新复用模块';
+		const description = (typeof args.description === 'string' ? args.description : '').slice(0, MAX_DESC_LEN);
+		const classification = Array.isArray(args.classification)
+			? args.classification.map(v => String(v).trim()).filter(Boolean)
+			: [];
+		const token = newToken();
+		s.cards.set(token, {
+			type: 'create_module',
+			status: 'open',
+			createModule: { snapshot, name, description, classification, libraries: libMap, defaultKey: picked.key },
+		});
+		const summary: CreateModuleSummaryView = {
+			parts: snapshot.parts.length,
+			wires: snapshot.wires.length,
+			netFlags: snapshot.netFlags.length,
+			netPorts: snapshot.netPorts.length,
+			designators: snapshot.parts.map(p => p.designator || p.deviceName).filter(Boolean).slice(0, SELECTION_DESIGNATOR_LIMIT),
+			nets: [...new Set([...snapshot.netFlags, ...snapshot.netPorts].map(f => f.net).filter(Boolean))].slice(0, SELECTION_DESIGNATOR_LIMIT),
+			unsupported: [...new Set(snapshot.unsupported)],
+		};
+		const card: CreateModuleCardView = {
+			type: 'create_module',
+			token,
+			name,
+			description,
+			classification,
+			summary,
+			libraries: libViews,
+			teamVisible: picked.kind === 'team',
+		};
+		return {
+			event: { name: 'propose_create_module', argsSummary: name, status: 'ok' },
+			card,
+			result: {
+				ok: true,
+				token,
+				summary,
+				hint: '已出示建模块确认卡，等待用户确认后才会写库。同一条回复里请告知用户：确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。',
+			},
+		};
+	},
 	propose_placement: async (s, args) => {
 		const rec = await loadModelCatalogRecord();
 		if (!rec)
@@ -986,6 +1120,8 @@ function summarizeToolArgs(name: string, args: Record<string, unknown>): string 
 			return String(args.cbbUuid || '(待解析)');
 		case 'propose_placement':
 			return Array.isArray(args.picks) ? `${args.picks.length} 个候选` : '候选';
+		case 'propose_create_module':
+			return String(args.name || '').trim() || '新建复用模块';
 		case 'propose_export':
 			return Array.isArray(args.cbbUuids) && args.cbbUuids.length ? `按需导出 ${args.cbbUuids.length} 项` : '全量导出确认卡';
 		case 'compact_history':
@@ -1180,6 +1316,75 @@ export async function confirmEdit(
 		return { ok: true };
 	}
 	catch (e) {
+		return { ok: false, error: e instanceof Error ? e.message : String(e) };
+	}
+}
+
+/** 建模块卡的确认入参：只接受用户可改的字段；目标库只收不透明 key，uuid 由服务端解析。 */
+export interface CreateModuleEditable {
+	name?: string;
+	description?: string;
+	classification?: Array<string>;
+	libraryKey?: string;
+}
+
+export interface CreateModuleConfirmResult {
+	ok: boolean;
+	cbbUuid?: string;
+	name?: string;
+	libraryLabel?: string;
+	rebuilt?: { parts: number; wires: number; netFlags: number; netPorts: number };
+	/** 未能重建的图元说明（器件缺库等），不阻断整体成功。 */
+	failures?: Array<string>;
+	error?: string;
+}
+
+/**
+ * 建模块确认：真正写库的入口。
+ *
+ * 以卡上快照为权威——选区只是「出卡那一刻」的输入，confirm 时不再重新读画布。
+ * 理由与 place/edit 卡一致：授权语义是「按这张卡执行」。卡上已回显将要写入的内容
+ * （各项计数 + 位号 + 网络名），用户看得见自己确认的是什么。
+ * 目标库只认卡上的不透明 key，uuid 从卡上候选取——客户端无法指定任意库。
+ */
+export async function confirmCreateModule(
+	sessionId: string,
+	token: string,
+	editable: CreateModuleEditable,
+): Promise<CreateModuleConfirmResult> {
+	const { session: s, card } = requireCard(sessionId, token, 'create_module');
+	const proposal = card.createModule;
+	if (!proposal)
+		throw new Error('确认卡缺少提案内容，请重新发起。');
+	const key = typeof editable?.libraryKey === 'string' && editable.libraryKey ? editable.libraryKey : proposal.defaultKey;
+	const target = proposal.libraries.get(key);
+	if (!target)
+		throw new Error('目标库不在本卡候选中，请重新发起。');
+	const name = (typeof editable?.name === 'string' && editable.name.trim() ? editable.name.trim() : proposal.name).slice(0, 60);
+	if (!name)
+		throw new Error('模块名称不能为空');
+	const description = (typeof editable?.description === 'string' ? editable.description : proposal.description).slice(0, MAX_DESC_LEN);
+	const classification = Array.isArray(editable?.classification)
+		? editable.classification.map(v => String(v).trim()).filter(Boolean)
+		: proposal.classification;
+	try {
+		const res = await createCbbModuleFromSelection({
+			libraryUuid: target.uuid,
+			name,
+			description,
+			classification,
+			snapshot: proposal.snapshot,
+		});
+		const rec = s.cards.get(token);
+		if (rec)
+			rec.status = 'done';
+		// 路径与 confirmEdit 相同：新建成功后目录里没有这个模块，旧缓存继续用会让
+		// 同会话的 search_modules 找不到刚建的模块。清掉后下一轮模型会先 refresh_catalog。
+		await clearCatalogRecord();
+		return { ok: true, cbbUuid: res.cbbUuid, name, libraryLabel: target.label, rebuilt: res.rebuilt, failures: res.failures.length ? res.failures : undefined };
+	}
+	catch (e) {
+		// 失败不置 done：用户可改参数后重试同一张卡。
 		return { ok: false, error: e instanceof Error ? e.message : String(e) };
 	}
 }

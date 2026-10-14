@@ -1,5 +1,6 @@
 /**
- * 对复用模块的读与写操作：读模块原理图摘要（AI 分析用）、符号放置、图页放置、改名称/描述。
+ * 对复用模块的读与写操作：读模块原理图摘要（AI 分析用）、符号放置、图页放置、改名称/描述、
+ * 从画布选中内容创建新模块。
  * 写画布/写库前由 agent 确认卡令牌把关；读模块页只切视图不改画布。
  *
  * 放置两轴（不再有第三种「区域」形式）：
@@ -8,9 +9,13 @@
  *
  * 实测：createCbbSymbol 可省略符号 uuid；假 uuid 会挂起 ≥8s，必须超时；
  * placeCbbSchematicPage 把模块原理图内容落到当前活动图页（不会自己建页）；
- * lib_Cbb.create 静默失败，只做 modify；每次放置有双重副作用（背板原理图 + 工程库副本）。
+ * 每次放置有双重副作用（背板原理图 + 工程库副本）。
  * 本地图页放置（2026-09-16 半离线 V3.2.166 实测）：lib_Cbb.get 对本地模块必崩（parent_tag），
  * 图页 uuid 改由 .eprj2 明文工程树解析（resolveCbbPageUuid → readLocalSheetUuid），放置返回 true。
+ *
+ * lib_Cbb.create 的版本差异（2026-10-14 更正）：V3.2.166 上静默返回 undefined（当年据此
+ * 判定「不可用」，见 SPEC §F1）；**V4.1.71 上已修复**——返回新模块 uuid，且新建模块自带
+ * board（含 schematic + pcb）。createCbbModuleFromSelection 依赖后者，失败时给出明确版本提示。
  */
 import { matchLocalEprjRow } from './catalog';
 import { edaGlobal, fmtErr, sleep, withTimeout } from './host';
@@ -26,6 +31,19 @@ const BOARD_PAGE_WAIT_MS = 30000;
 /** 新建板子后板子行本身出现在 getAllBoardsInfo 的等待预算（板行比图页同步快，失败时不必干等满额切页预算）。 */
 const BOARD_APPEAR_WAIT_MS = 10000;
 const SAVE_TIMEOUT_MS = 20000;
+/** lib_Cbb.create：建空壳模块并拿到 cbbUuid。 */
+const CREATE_TIMEOUT_MS = 30000;
+/** lib_Cbb.openProjectInEditor / dmt_Project.openProject：切工程。 */
+const OPEN_MODULE_TIMEOUT_MS = 30000;
+/** lib_Device.search：按元件名回库找器件对象（重建元件用）。 */
+const DEVICE_LOOKUP_TIMEOUT_MS = 10000;
+/** 单个图元重建（component/wire/flag/port create）。 */
+const REBUILD_ONE_TIMEOUT_MS = 15000;
+/** 选区规模上限：超限直接拒绝，避免一次重建耗时过长。 */
+export const MAX_CREATE_PARTS = 300;
+export const MAX_CREATE_WIRES = 1000;
+/** 选中集超出此数时不在卡上逐个列位号，只给计数。 */
+export const SELECTION_DESIGNATOR_LIMIT = 20;
 /** EDMT_EditorDocumentType：原理图页 / PCB / 面板，对应 sch|pcb|pnl_Document.save。 */
 const DOC_SCHEMATIC_PAGE = 1;
 const DOC_PCB = 3;
@@ -1194,6 +1212,519 @@ export async function modifyCbbModule(params: ModifyCbbParams): Promise<void> {
 	}
 	if (ok !== true)
 		throw new Error('修改未成功（接口返回 false），请稍后重试');
+}
+
+// ── 从画布选中内容创建复用模块 ──────────────────────────────────────────
+//
+// 链路（2026-10-14 真机 V4.1.71 逐段实测通过）：
+//   记原工程/原页 → 保存当前文档（否则切工程弹窗、扩展点不了）→ lib_Cbb.create 建空壳
+//   → openProjectInEditor 打开模块工程 → getAllSchematicPagesInfo 取模块页 → openDocument
+//   → 逐图元重建 → sch_Document.save → finally 切回原工程与原页
+//
+// 两个实测坑（违反必出错）：
+// 1) 器件重建必须传**完整器件对象**（lib_Device.search 的结果），传裸 {libraryUuid, uuid}
+//    会静默失败。而元件自带的 getState_Component().uuid 是**工程内副本 uuid**，拿它回库
+//    查（lib_Device.get 返回 undefined）查不到——唯一可靠的桥是**器件名**：search(元件名)
+//    再取 name 精确匹配的那条。
+// 2) create() 返回的 primitiveId **不可靠**：同一调用有时返回、有时不返回，但元件都落页了。
+//    成败一律以「回读页面」判定，不看返回值。同理，改动后立刻读���会拿到旧值，故回读前先 sleep。
+
+/** 单个待重建器件。 */
+export interface SelectionPart {
+	designator?: string;
+	/** 库器件名：回库查器件对象的唯一依据（不能用元件自带 uuid，那是工程内副本）。 */
+	deviceName: string;
+	libraryUuid: string;
+	subPartName?: string;
+	x: number;
+	y: number;
+	rotation: number;
+	mirror: boolean;
+}
+
+/** 单条待重建走线。 */
+export interface SelectionWire {
+	line: Array<number> | Array<Array<number>>;
+	net: string;
+	color: string | null;
+	lineWidth: number | null;
+	lineType: unknown;
+}
+
+/** 单个待重建网络标志 / 网络端口：类型由 componentName 解析（见 parseNetFlagKind / parseNetPortDirection）。 */
+export interface SelectionPortLike {
+	componentName: string;
+	net: string;
+	x: number;
+	y: number;
+	rotation: number;
+	mirror: boolean;
+}
+
+/** 画布选区的规范化快照：propose 时读一次，confirm 时以它为准重建。 */
+export interface SelectionSnapshot {
+	parts: Array<SelectionPart>;
+	wires: Array<SelectionWire>;
+	netFlags: Array<SelectionPortLike>;
+	netPorts: Array<SelectionPortLike>;
+	/** 选区里被跳过的图元类型（文字/图形/离图连接器等），仅在卡上提示。 */
+	unsupported: Array<string>;
+	/** 选区图元 id。 */
+	primitiveIds: Array<string>;
+	/** id 排序拼接的指纹：confirm 时复核画布未漂移。 */
+	fingerprint: string;
+}
+
+function emptySnapshot(): SelectionSnapshot {
+	return { parts: [], wires: [], netFlags: [], netPorts: [], unsupported: [], primitiveIds: [], fingerprint: '' };
+}
+
+/**
+ * 网络标志类型解析。实测（V4.1.71）createNetFlag 传入 → 读回 getState_Component().name：
+ *   Power → `Power-*`；Ground → `Ground-GND`；AnalogGround → `Ground-AGND`；ProtectGround → `Ground-PGND`。
+ * 后缀是**类型标签不是网络名**（用 net='ZZTEST' 建过，读回仍是 AGND/PGND），故可确定映射。
+ * ★ 必须先判 AnalogGround / ProtectGround 再判 Ground，否则都被 `Ground` 前缀抢先命中。
+ */
+export function parseNetFlagKind(componentName: string): 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround' | null {
+	const n = (componentName || '').trim();
+	if (n.startsWith('Power'))
+		return 'Power';
+	// Ground 家族三者都带 `Ground-` 前缀，靠后缀标签区分，顺序不可调（先 AGND/PGND 再 Ground）。
+	if (n.includes('AGND') || n.includes('AnalogGround'))
+		return 'AnalogGround';
+	if (n.includes('PGND') || n.includes('ProtectGround'))
+		return 'ProtectGround';
+	if (n.startsWith('Ground'))
+		return 'Ground';
+	return null;
+}
+
+/**
+ * 网络端口方向解析：实测 createNetPort 传入 IN/OUT/BI → 读回 `Netport-IN` / `Netport-OUT` / `Netport-BI`。
+ * 同时接受裸的 IN/OUT/BI（宿主若改变命名仍可用）；不做宽松后缀匹配，避免 'PIN' 之类被误判成 IN。
+ */
+export function parseNetPortDirection(componentName: string): 'IN' | 'OUT' | 'BI' | null {
+	const n = (componentName || '').trim();
+	const bare = n.startsWith('Netport-') ? n.slice('Netport-'.length).toUpperCase() : n.toUpperCase();
+	return bare === 'IN' || bare === 'OUT' || bare === 'BI' ? bare : null;
+}
+
+function pageFingerprint(ids: Array<string>): string {
+	return [...ids].sort().join('\u0001');
+}
+
+/**
+ * 读当前画布的选中内容并规范化。只读，不改画布。
+ * 非原理图页抛错；空选区返回空快照（由上层给出「请先选中」提示，不在此抛）。
+ */
+export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
+	const state = await getCurrentDocState();
+	if (!state.ok)
+		throw new Error('当前活动文档不是原理图页。请先切换到原理图页并选中要存成模块的内容。');
+	const sel = edaGlobal()?.sch_SelectControl as
+		| { getAllSelectedPrimitives_PrimitiveId?: () => Promise<Array<string> | undefined> }
+		| undefined;
+	if (typeof sel?.getAllSelectedPrimitives_PrimitiveId !== 'function')
+		throw new Error('sch_SelectControl.getAllSelectedPrimitives_PrimitiveId 不可用（宿主版本过低或不支持）');
+	let ids: Array<string> = [];
+	try {
+		ids = (await withTimeout(sel.getAllSelectedPrimitives_PrimitiveId(), 15000, '读取选区超时')) || [];
+	}
+	catch (e) {
+		throw new Error(`读取选区失败：${fmtErr(e)}`);
+	}
+	ids = ids.filter(id => typeof id === 'string' && id);
+	if (!ids.length)
+		return emptySnapshot();
+
+	const prim = edaGlobal()?.sch_Primitive as
+		| { getPrimitivesByPrimitiveId?: (ids: Array<string>) => Promise<Array<Record<string, unknown>>> }
+		| undefined;
+	if (typeof prim?.getPrimitivesByPrimitiveId !== 'function')
+		throw new Error('sch_Primitive.getPrimitivesByPrimitiveId 不可用（宿主版本过低或不支持）');
+	let objs: Array<Record<string, unknown>> = [];
+	try {
+		objs = (await withTimeout(prim.getPrimitivesByPrimitiveId(ids), 15000, '读取选中图元超时')) || [];
+	}
+	catch (e) {
+		throw new Error(`读取选中图元失败：${fmtErr(e)}`);
+	}
+
+	const snap = emptySnapshot();
+	snap.primitiveIds = ids;
+	snap.fingerprint = pageFingerprint(ids);
+	const read = (o: Record<string, unknown>, k: string): unknown => {
+		try {
+			const fn = o?.[k];
+			return typeof fn === 'function' ? (fn as () => unknown).call(o) : undefined;
+		}
+		catch { return undefined; }
+	};
+	const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+
+	for (const o of Array.isArray(objs) ? objs : []) {
+		// 鸭子分型：元件有 getState_ComponentType，走线有 getState_Line。
+		const cType = read(o, 'getState_ComponentType');
+		const line = read(o, 'getState_Line');
+		if (typeof cType === 'string') {
+			if (cType === 'sheet')
+				continue; // 页框不是内容
+			const comp = read(o, 'getState_Component') as { name?: unknown; libraryUuid?: unknown } | undefined;
+			const cName = comp && typeof comp.name === 'string' ? comp.name : '';
+			const libUuid = comp && typeof comp.libraryUuid === 'string' ? comp.libraryUuid : '';
+			const at = { x: num(read(o, 'getState_X')), y: num(read(o, 'getState_Y')), rotation: num(read(o, 'getState_Rotation')), mirror: read(o, 'getState_Mirror') === true };
+			const net = typeof read(o, 'getState_Net') === 'string' ? String(read(o, 'getState_Net')) : '';
+			if (cType === 'part') {
+				const sub = read(o, 'getState_SubPartName');
+				snap.parts.push({
+					designator: typeof read(o, 'getState_Designator') === 'string' ? String(read(o, 'getState_Designator')) : undefined,
+					deviceName: cName,
+					libraryUuid: libUuid,
+					subPartName: typeof sub === 'string' && sub ? sub : undefined,
+					...at,
+				});
+			}
+			else if (cType === 'netflag') {
+				snap.netFlags.push({ componentName: cName, net, ...at });
+			}
+			else if (cType === 'netport') {
+				snap.netPorts.push({ componentName: cName, net, ...at });
+			}
+			else {
+				snap.unsupported.push(cType);
+			}
+			continue;
+		}
+		if (line !== undefined) {
+			const color = read(o, 'getState_Color');
+			const lw = read(o, 'getState_LineWidth');
+			const lt = read(o, 'getState_LineType');
+			const net = read(o, 'getState_Net');
+			snap.wires.push({
+				line: line as Array<number> | Array<Array<number>>,
+				net: typeof net === 'string' ? net : '',
+				color: typeof color === 'string' ? color : null,
+				lineWidth: typeof lw === 'number' ? lw : null,
+				lineType: lt === undefined ? null : lt,
+			});
+			continue;
+		}
+		snap.unsupported.push('unknown');
+	}
+	return snap;
+}
+
+/** 选区规模校验：超限拒绝，避免一次重建耗时过长。 */
+export function assertSelectionSize(snap: SelectionSnapshot): void {
+	if (snap.parts.length > MAX_CREATE_PARTS)
+		throw new Error(`选中的器件过多（${snap.parts.length} 个，上限 ${MAX_CREATE_PARTS}）。请缩小选择范围后重试。`);
+	if (snap.wires.length > MAX_CREATE_WIRES)
+		throw new Error(`选中的走线过多（${snap.wires.length} 条，上限 ${MAX_CREATE_WIRES}）。请缩小选择范围后重试。`);
+}
+
+/**
+ * 按器件名回库取器件对象：search(名, 库) 后取 name **精确匹配**的那条。
+ * 实测 search 会返回模糊命中的其它器件（如搜 'Res_0603' 首条是 'YFT0603X103F3950FA'），
+ * 不精确匹配就会建出错件。找不到返回 null（调用方计入失败清单）。
+ */
+async function resolveDeviceItem(deviceName: string, libraryUuid: string): Promise<Record<string, unknown> | null> {
+	if (!deviceName)
+		return null;
+	const dev = edaGlobal()?.lib_Device as
+		| { search?: (key: string, libraryUuid?: string) => Promise<Array<Record<string, unknown>>> }
+		| undefined;
+	if (typeof dev?.search !== 'function')
+		return null;
+	try {
+		const rows = await withTimeout(dev.search(deviceName, libraryUuid), DEVICE_LOOKUP_TIMEOUT_MS, '查找器件超时');
+		const hit = (Array.isArray(rows) ? rows : []).find(r => String(r?.name ?? '') === deviceName);
+		return hit || null;
+	}
+	catch {
+		return null;
+	}
+}
+
+export interface CreateCbbModuleParams {
+	libraryUuid: string;
+	name: string;
+	description: string;
+	classification?: Array<string>;
+	snapshot: SelectionSnapshot;
+}
+
+export interface CreateCbbModuleResult {
+	cbbUuid: string;
+	pageUuid: string;
+	pageName: string;
+	rebuilt: { parts: number; wires: number; netFlags: number; netPorts: number };
+	/** 逐条失败说明（器件缺库、走线创建失败等），不中断整体。 */
+	failures: Array<string>;
+}
+
+/**
+ * 从选区快照创建复用模块并写入库。
+ *
+ * 重建顺序固定为 器件 → 网络标志 → 网络端口 → 走线：走线放最后，端点才落在已带网的引脚上
+ * （若先建走线再接网络，端点会落在无网或异网的图元上，宿主会拒绝创建）。
+ *
+ * 无论中途哪一步失败，finally 都会切回原工程与原页——否则用户被留在模块工程里。
+ */
+export async function createCbbModuleFromSelection(params: CreateCbbModuleParams): Promise<CreateCbbModuleResult> {
+	if (!params.libraryUuid)
+		throw new Error('缺少目标库标识');
+	if (!params.name.trim())
+		throw new Error('模块名称不能为空');
+	assertPlaceableLibrary(params.libraryUuid);
+	assertSelectionSize(params.snapshot);
+
+	const cbbApi = edaGlobal()?.lib_Cbb as
+		| {
+			create?: (libraryUuid: string, cbbName: string, classification?: unknown, description?: string) => Promise<string | undefined>;
+			openProjectInEditor?: (cbbUuid: string, libraryUuid: string) => Promise<boolean>;
+			delete?: (cbbUuid: string, libraryUuid: string) => Promise<boolean>;
+		}
+		| undefined;
+	if (typeof cbbApi?.create !== 'function')
+		throw new Error('lib_Cbb.create 不可用（宿主版本过低或不支持）。创建模块需要 V4.1.71 及以上。');
+
+	const proj = edaGlobal()?.dmt_Project as ProjectApi | undefined;
+	const originProjectUuid = await readCurrentProjectUuid(proj);
+	const originDoc = await getCurrentDocState();
+	const originPageUuid = originDoc.uuid || '';
+
+	// 1) 切工程前先保存：未保存时 openProjectInEditor 会弹确认框，扩展点不了，调用直接失败。
+	await saveCurrentProjectDocuments();
+
+	// 2) 建空壳。失败是静默 undefined，不抛错——必须显式判。
+	let cbbUuid = '';
+	try {
+		const got = await withTimeout(
+			cbbApi.create(params.libraryUuid, params.name.trim(), params.classification || [], params.description),
+			CREATE_TIMEOUT_MS,
+			'新建模块超时（30s）——请重试',
+		);
+		cbbUuid = typeof got === 'string' ? got : '';
+	}
+	catch (e) {
+		throw new Error(`新建模块失败：${fmtErr(e)}`);
+	}
+	if (!cbbUuid)
+		throw new Error('新建模块未成功（宿主静默返回空 uuid）。可能是该库无写权限，或客户端版本低于 V4.1.71。');
+
+	const failures: Array<string> = [];
+	const rebuilt = { parts: 0, wires: 0, netFlags: 0, netPorts: 0 };
+	let pageUuid = '';
+	let pageName = '';
+	try {
+		// 3) 打开模块工程。文档警告：会丢弃原工程未保存内容（已在上方保存当前文档）。
+		if (typeof cbbApi.openProjectInEditor !== 'function')
+			throw new Error('lib_Cbb.openProjectInEditor 不可用（宿主版本过低或不支持）');
+		const opened = await withTimeout(
+			cbbApi.openProjectInEditor(cbbUuid, params.libraryUuid),
+			OPEN_MODULE_TIMEOUT_MS,
+			'打开模块工程超时（30s）',
+		);
+		if (opened !== true)
+			throw new Error('打开新建的模块工程失败');
+		await sleep(1500);
+
+		// 4) 模块工程打开后没有活动文档，必须自行找到并激活它的原理图页。
+		const page = await openModuleFirstPage();
+		pageUuid = page.pageUuid;
+		pageName = page.pageName;
+
+		// 5) 重建：顺序不可调（见函数注释）。
+		await rebuildParts(params.snapshot.parts, failures, rebuilt);
+		await rebuildFlags(params.snapshot.netFlags, failures, rebuilt);
+		await rebuildPorts(params.snapshot.netPorts, failures, rebuilt);
+		await rebuildWires(params.snapshot.wires, failures, rebuilt);
+
+		// 6) 落盘。回读前先等一拍：实测改动后立刻读会拿到旧值。
+		await sleep(800);
+		const doc = edaGlobal()?.sch_Document as { save?: () => Promise<boolean> } | undefined;
+		if (typeof doc?.save !== 'function')
+			throw new Error('sch_Document.save 不可用');
+		const saved = await withTimeout(doc.save(), SAVE_TIMEOUT_MS, '保存模块超时（20s）');
+		if (saved !== true)
+			throw new Error('保存模块失败（接口返回 false）');
+	}
+	catch (e) {
+		// 模块已建成但内容写入失败：回滚删除，避免库里留空壳。删除失败只记录不覆盖原错误。
+		try {
+			if (typeof cbbApi.delete === 'function')
+				await withTimeout(cbbApi.delete(cbbUuid, params.libraryUuid), MODIFY_TIMEOUT_MS, '回滚删除超时');
+		}
+		catch { /* 回滚失败不掩盖原始错误，提示里已含模块名 */ }
+		throw new Error(`创建模块内容失败，已回滚（${params.name.trim()}）：${fmtErr(e)}`);
+	}
+	finally {
+		// 必须切回：否则用户被留在模块工程里。切回失败无法补救，只能靠上层提示。
+		try {
+			if (originProjectUuid && typeof proj?.openProject === 'function')
+				await withTimeout(proj.openProject(originProjectUuid), OPEN_MODULE_TIMEOUT_MS, '切回原工程超时');
+			await sleep(1500);
+			if (originPageUuid)
+				await activateSchematicPage(originPageUuid);
+		}
+		catch { /* 见上 */ }
+	}
+
+	return { cbbUuid, pageUuid, pageName, rebuilt, failures };
+}
+
+/** 打开模块工程里的第一个原理图页（优先名为 P1 的）。 */
+async function openModuleFirstPage(): Promise<{ pageUuid: string; pageName: string }> {
+	const sch = edaGlobal()?.dmt_Schematic as
+		| { getAllSchematicPagesInfo?: () => Promise<Array<{ uuid?: string; name?: string }>> }
+		| undefined;
+	if (typeof sch?.getAllSchematicPagesInfo !== 'function')
+		throw new Error('dmt_Schematic.getAllSchematicPagesInfo 不可用');
+	const pages = (await withTimeout(sch.getAllSchematicPagesInfo(), 15000, '读取模块图页超时')) || [];
+	const list = (Array.isArray(pages) ? pages : []).filter(p => typeof p?.uuid === 'string' && p.uuid);
+	if (!list.length)
+		throw new Error('新建的模块工程里没有原理图页');
+	const first = list.find(p => p.name === 'P1') || list[0];
+	await activateSchematicPage(String(first.uuid));
+	return { pageUuid: String(first.uuid), pageName: typeof first.name === 'string' ? first.name : '' };
+}
+
+/** 回读页面现存器件数与走线数（成败判定只能靠它，create 的返回值不可靠）。 */
+async function countPageContent(): Promise<{ comps: number; wires: number }> {
+	const comp = edaGlobal()?.sch_PrimitiveComponent as { getAll?: () => Promise<unknown> } | undefined;
+	const wire = edaGlobal()?.sch_PrimitiveWire as { getAllPrimitiveId?: () => Promise<unknown> } | undefined;
+	let comps = 0;
+	let wires = 0;
+	try {
+		const rows = typeof comp?.getAll === 'function' ? await comp.getAll() : [];
+		comps = Array.isArray(rows) ? rows.length : 0;
+	}
+	catch { /* 读不到按 0 计，由调用方按差值判断 */ }
+	try {
+		const rows = typeof wire?.getAllPrimitiveId === 'function' ? await wire.getAllPrimitiveId() : [];
+		wires = Array.isArray(rows) ? rows.length : 0;
+	}
+	catch { /* 同上 */ }
+	return { comps, wires };
+}
+
+async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>, rebuilt: { parts: number }): Promise<void> {
+	if (!parts.length)
+		return;
+	const comp = edaGlobal()?.sch_PrimitiveComponent as
+		| { create?: (...args: Array<unknown>) => Promise<unknown> }
+		| undefined;
+	if (typeof comp?.create !== 'function') {
+		failures.push(`器件重建不可用：sch_PrimitiveComponent.create 缺失（${parts.length} 个未重建）`);
+		return;
+	}
+	const before = (await countPageContent()).comps;
+	for (const p of parts) {
+		const label = p.designator || p.deviceName || '(未命名器件)';
+		const dev = await resolveDeviceItem(p.deviceName, p.libraryUuid);
+		if (!dev) {
+			failures.push(`器件 ${label}：库中找不到名为「${p.deviceName}」的器件`);
+			continue;
+		}
+		try {
+			await withTimeout(
+				comp.create(dev, p.x, p.y, p.subPartName, p.rotation, p.mirror, true, true),
+				REBUILD_ONE_TIMEOUT_MS,
+				`重建器件 ${label} 超时`,
+			);
+		}
+		catch (e) {
+			failures.push(`器件 ${label}：${fmtErr(e)}`);
+		}
+	}
+	await sleep(500);
+	// create 的返回值不可靠（实测同一调用有时无 primitiveId 但元件已落页），按数量差计入成功数。
+	rebuilt.parts = Math.max(0, (await countPageContent()).comps - before);
+}
+
+async function rebuildFlags(flags: Array<SelectionPortLike>, failures: Array<string>, rebuilt: { netFlags: number }): Promise<void> {
+	if (!flags.length)
+		return;
+	const comp = edaGlobal()?.sch_PrimitiveComponent as
+		| { createNetFlag?: (...args: Array<unknown>) => Promise<unknown> }
+		| undefined;
+	if (typeof comp?.createNetFlag !== 'function') {
+		failures.push(`网络标志重建不可用：createNetFlag 缺失（${flags.length} 个未重建）`);
+		return;
+	}
+	const before = (await countPageContent()).comps;
+	for (const f of flags) {
+		const kind = parseNetFlagKind(f.componentName);
+		if (!kind) {
+			failures.push(`网络标志 ${f.net || f.componentName}：无法识别类型（${f.componentName}）`);
+			continue;
+		}
+		try {
+			await withTimeout(comp.createNetFlag(kind, f.net, f.x, f.y, f.rotation, f.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络标志 ${f.net} 超时`);
+		}
+		catch (e) {
+			failures.push(`网络标志 ${f.net}：${fmtErr(e)}`);
+		}
+	}
+	await sleep(500);
+	rebuilt.netFlags = Math.max(0, (await countPageContent()).comps - before);
+}
+
+async function rebuildPorts(ports: Array<SelectionPortLike>, failures: Array<string>, rebuilt: { netPorts: number }): Promise<void> {
+	if (!ports.length)
+		return;
+	const comp = edaGlobal()?.sch_PrimitiveComponent as
+		| { createNetPort?: (...args: Array<unknown>) => Promise<unknown> }
+		| undefined;
+	if (typeof comp?.createNetPort !== 'function') {
+		failures.push(`网络端口重建不可用：createNetPort 缺失（${ports.length} 个未重建）`);
+		return;
+	}
+	const before = (await countPageContent()).comps;
+	for (const p of ports) {
+		const dir = parseNetPortDirection(p.componentName);
+		if (!dir) {
+			failures.push(`网络端口 ${p.net || p.componentName}：无法识别方向（${p.componentName}）`);
+			continue;
+		}
+		try {
+			await withTimeout(comp.createNetPort(dir, p.net, p.x, p.y, p.rotation, p.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络端口 ${p.net} 超时`);
+		}
+		catch (e) {
+			failures.push(`网络端口 ${p.net}：${fmtErr(e)}`);
+		}
+	}
+	await sleep(500);
+	rebuilt.netPorts = Math.max(0, (await countPageContent()).comps - before);
+}
+
+async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>, rebuilt: { wires: number }): Promise<void> {
+	if (!wires.length)
+		return;
+	const wire = edaGlobal()?.sch_PrimitiveWire as
+		| { create?: (...args: Array<unknown>) => Promise<unknown> }
+		| undefined;
+	if (typeof wire?.create !== 'function') {
+		failures.push(`走线重建不可用：sch_PrimitiveWire.create 缺失（${wires.length} 条未重建）`);
+		return;
+	}
+	const before = (await countPageContent()).wires;
+	for (const w of wires) {
+		try {
+			await withTimeout(wire.create(w.line, w.net, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
+		}
+		catch (e) {
+			// 带网创建失败时重试一次不带网（让走线跟随落点图元的网络），成功则不算失败。
+			try {
+				await withTimeout(wire.create(w.line, undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
+			}
+			catch {
+				failures.push(`走线（${w.net || '无网络'}）：${fmtErr(e)}`);
+			}
+		}
+	}
+	await sleep(500);
+	rebuilt.wires = Math.max(0, (await countPageContent()).wires - before);
 }
 
 /** 摘要里的单行器件：位号 d / 画布名 n / 库器件名 dev / 封装名 fp。 */

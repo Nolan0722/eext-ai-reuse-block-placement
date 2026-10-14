@@ -196,6 +196,41 @@ async function resolveLibraries(scope: Partial<LibraryScope>, clientMode: Client
 	return out;
 }
 
+/** 可写入的云库（创建模块的目标库候选）。本地库是磁盘路径、lib_Cbb.create 不适用，故排除。 */
+export interface WritableLibrary {
+	kind: 'personal' | 'team';
+	label: string;
+	uuid: string;
+}
+
+/**
+ * 列出可作为「创建模块」目标的可写云库：个人库 + 团队库，个人库优先。
+ *
+ * 不复用目录缓存（loadCatalogRecord）——目录可能为空或过期，而创建模块不应依赖先拉目录。
+ * 半离线/全离线模式下个人库与团队库都不可达，此处自然返回空数组，由调用方给出明确提示。
+ */
+export async function listWritableLibraries(): Promise<Array<WritableLibrary>> {
+	let mode: ClientModeHint = 'unknown';
+	try {
+		const { detectClientEnv } = await import('./env');
+		mode = (await detectClientEnv()).mode;
+	}
+	catch { /* 模式未知时按在线处理，靠失败隔离兜底 */ }
+	let resolved: Array<ResolvedLibrary> = [];
+	try {
+		resolved = await resolveLibraries({ personal: true, team: true, local: false }, mode);
+	}
+	catch {
+		return [];
+	}
+	const order: Record<string, number> = { personal: 0, team: 1 };
+	return resolved
+		.filter((l): l is ResolvedLibrary & { kind: 'personal' | 'team'; uuid: string } =>
+			(l.kind === 'personal' || l.kind === 'team') && typeof l.uuid === 'string' && !!l.uuid)
+		.map(l => ({ kind: l.kind, label: l.label, uuid: l.uuid }))
+		.sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9));
+}
+
 /** 单库分页拉全量。page 为 1 起（page 0 恒空）。uuid 去重 + 空页/无新增即停。 */
 async function fetchLibraryModules(uuid: string): Promise<Array<CatalogModule>> {
 	const cbb = edaGlobal()?.lib_Cbb as Record<string, unknown> | undefined;

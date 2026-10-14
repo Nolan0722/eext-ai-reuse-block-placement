@@ -1,13 +1,13 @@
 /**
  * 扩展入口 + iframe 桥。UI 在 iframe/chat.html；写画布/写库/导出必须走确认卡令牌。
  */
-import type { AgentEvent, CatalogStatsView, ChatTurnResult, PlaceCbbItem } from './agent/loop';
+import type { AgentEvent, CatalogStatsView, ChatTurnResult, CreateModuleConfirmResult, CreateModuleEditable, PlaceCbbItem } from './agent/loop';
 import type { CatalogImportApplied, CatalogImportPolicy, CatalogImportPreview, CatalogLibraryAdmin } from './agent/store';
 import type { JevSettings, LlmSettings, PlacementSettings } from './settings';
 import * as extensionConfig from '../extension.json';
 import { abortSession } from './agent/http';
 import { testJevConnection } from './agent/jev';
-import { cancelCard, chatTurn, confirmEdit, confirmExport, confirmPlace, resetChatSession, testLlmConnection } from './agent/loop';
+import { cancelCard, chatTurn, confirmCreateModule, confirmEdit, confirmExport, confirmPlace, resetChatSession, testLlmConnection } from './agent/loop';
 import { applyCatalogImport, describeCatalogLibraries, exportCatalog, previewCatalogImport, refreshCatalogExclusive } from './agent/store';
 import { runSelfCheck } from './env';
 import { edaGlobal } from './host';
@@ -51,6 +51,8 @@ export interface CbbCopilotBridge {
 	confirmPlace: (sessionId: string, token: string, items: Array<PlaceCbbItem>, grid?: { dx: number; dy: number }) => Promise<{ results: Array<{ cbbUuid: string; name: string; ok: boolean; error?: string; pageName?: string; fallbackFromSymbol?: boolean }> }>;
 	confirmEdit: (sessionId: string, token: string, editable: { name: string; description: string }) => Promise<{ ok: boolean; error?: string }>;
 	confirmExport: (sessionId: string, token: string, uuids: Array<string>) => Promise<{ ok: boolean; stats?: CatalogStatsView; fileName?: string; error?: string }>;
+	/** 建模块确认：libraryKey 是卡上的不透明键，uuid 由主进程解析——前端无法指定任意目标库。 */
+	confirmCreateModule: (sessionId: string, token: string, editable: CreateModuleEditable) => Promise<CreateModuleConfirmResult>;
 	cancelCard: (sessionId: string, token: string) => void;
 	resetChatSession: (sessionId: string) => void;
 	selfCheck: () => Promise<string>;
@@ -136,6 +138,7 @@ function installBridge(): void {
 		confirmPlace,
 		confirmEdit,
 		confirmExport,
+		confirmCreateModule,
 		cancelCard,
 		resetChatSession: (sessionId) => {
 			agentEventListeners.delete(sessionId);
