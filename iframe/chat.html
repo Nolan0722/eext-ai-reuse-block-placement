@@ -1482,6 +1482,7 @@
           <select class="cm-lib" style="${inputStyle}">${options}</select>
           <div class="hint cm-teamnote" style="display:${card.teamVisible ? 'block' : 'none'}">目标库是团队库，写入后<strong>团队成员可见</strong>。</div>
           ${skipped}
+          <div class="hint">工程内编辑过的元件符号不会随模块带过去，与其相连的导线可能断开——创建后请核对。</div>
           <div class="hint">确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。切换期间请勿操作编辑器。</div>
         </div>`,
       footHTML: `<button class="btn primary act-create">创建模块</button><span class="spacer"></span><button class="btn act-cancel">取消</button>`,

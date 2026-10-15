@@ -1246,11 +1246,46 @@ export interface SelectionPart {
 	y: number;
 	rotation: number;
 	mirror: boolean;
+	// ── 以下为「属性保真」：create() 只会给器件默认值，位号/值/采购信息等都要靠 modify 事后还原 ──
+	/** 显示名表达式（如 `={Value}` / `={Manufacturer Part}`）。 */
+	name?: string;
+	uniqueId?: string;
+	manufacturer?: string;
+	manufacturerId?: string;
+	supplier?: string;
+	supplierId?: string;
+	addIntoBom?: boolean;
+	addIntoPcb?: boolean;
+	/** 用户属性（已剔除指向工程内副本的引用键，见 pickCarryOverProperties）。 */
+	otherProperty?: Record<string, string | number | boolean>;
+}
+
+/**
+ * 不从原工程带过去的属性键。
+ * - `Device` / `Symbol` / `Footprint`：值是**当前工程的库内副本 uuid**，带到新模块里指向不存在的对象；
+ * - `Reuse Block` / `Group ID` / `Channel ID`：放置 CBB 时产生的分组标记，带过去会残留旧分组关系。
+ * 其余用户属性（Value、采购信息、Description、PCB Layer、3D/仿真模型等）一律保留。
+ */
+const NON_PORTABLE_PROPERTY_KEYS = new Set(['Device', 'Symbol', 'Footprint', 'Reuse Block', 'Group ID', 'Channel ID']);
+
+/** 过滤出可跨工程携带的属性（只留标量值；引用类键见 NON_PORTABLE_PROPERTY_KEYS）。 */
+export function pickCarryOverProperties(raw: unknown): Record<string, string | number | boolean> {
+	const out: Record<string, string | number | boolean> = {};
+	if (!raw || typeof raw !== 'object')
+		return out;
+	for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+		if (NON_PORTABLE_PROPERTY_KEYS.has(k))
+			continue;
+		if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+			out[k] = v;
+	}
+	return out;
 }
 
 /** 单条待重建走线。 */
 export interface SelectionWire {
 	line: Array<number> | Array<Array<number>>;
+	/** 逻辑走线上**存储**的 net（可能为空串 = 原图就没存，网络靠连接推导）。 */
 	net: string;
 	color: string | null;
 	lineWidth: number | null;
@@ -1360,6 +1395,8 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 		catch { return undefined; }
 	};
 	const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+	/** 被跳过的零长度走线数（不承载连接，宿主必拒；末尾计入"未写入"提示）。 */
+	let degenerate = 0;
 
 	for (const o of Array.isArray(objs) ? objs : []) {
 		// 鸭子分型：元件有 getState_ComponentType，走线有 getState_Line。
@@ -1387,12 +1424,28 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 			const net = (typeof netRaw === 'string' && netRaw) ? netRaw : (typeof nameRaw === 'string' ? nameRaw : '');
 			if (cType === 'part') {
 				const sub = read(o, 'getState_SubPartName');
+				const str = (k: string): string | undefined => {
+					const v = read(o, k);
+					return typeof v === 'string' && v ? v : undefined;
+				};
+				// 属性保真：create() 只给器件默认值，位号/显示名/厂商/采购/自定义属性都在这里记下来，
+				// 创建后用 modify 还原（见 rebuildParts）。otherProperty 过滤掉指向工程内副本的引用键。
+				const otherRaw = read(o, 'getState_OtherProperty') ?? o.otherProperty;
 				snap.parts.push({
-					designator: typeof read(o, 'getState_Designator') === 'string' ? String(read(o, 'getState_Designator')) : undefined,
+					designator: str('getState_Designator'),
 					deviceName: cName,
 					libraryUuid: libUuid,
 					symbolName,
 					subPartName: typeof sub === 'string' && sub ? sub : undefined,
+					name: str('getState_Name'),
+					uniqueId: str('getState_UniqueId'),
+					manufacturer: str('getState_Manufacturer'),
+					manufacturerId: str('getState_ManufacturerId'),
+					supplier: str('getState_Supplier'),
+					supplierId: str('getState_SupplierId'),
+					addIntoBom: read(o, 'getState_AddIntoBom') === true,
+					addIntoPcb: read(o, 'getState_AddIntoPcb') === true,
+					otherProperty: pickCarryOverProperties(otherRaw),
 					...at,
 				});
 			}
@@ -1408,6 +1461,14 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 			continue;
 		}
 		if (line !== undefined) {
+			// 走线按**分段**直接入快照，段上带的 net 一并保留。
+			// 曾试过归并回逻辑走线以求「不多出网络标签」，但归并后不带 net 建会被宿主拒绝
+			// （create failed!），把线丢了——**连通性优先，标签不管**，这里回退为逐段带 net。
+			// 唯一的例外是零长度段（所有点重合）：宿主必拒且它不承载任何连接，跳过并计入"未写入"。
+			if (isDegenerateWireLine(flattenWireLine(line))) {
+				degenerate++;
+				continue;
+			}
 			const color = read(o, 'getState_Color');
 			const lw = read(o, 'getState_LineWidth');
 			const lt = read(o, 'getState_LineType');
@@ -1423,7 +1484,31 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 		}
 		snap.unsupported.push('unknown');
 	}
+	if (degenerate)
+		snap.unsupported.push(`零长度走线×${degenerate}`);
 	return snap;
+}
+
+/** 把 getState_Line() 的返回值（扁平或嵌套）拉平成一维数字数组 `[x1,y1,x2,y2,…]`。 */
+function flattenWireLine(line: unknown): Array<number> {
+	if (!Array.isArray(line))
+		return [];
+	return (Array.isArray(line[0]) ? (line as Array<Array<number>>).flat() : (line as Array<number>)).filter(n => typeof n === 'number');
+}
+
+/**
+ * 零长度走线：点数不足两个，或所有点都重合。
+ * 实测（V4.1.71）宿主**拒绝创建**这种走线，抛「create failed!」；而它不承载任何连接、
+ * 在原图上也看不见，因此跳过是对的——但必须计入「未写入」提示，不能静默吞掉。
+ */
+function isDegenerateWireLine(pts: Array<number>): boolean {
+	if (pts.length < 4)
+		return true;
+	for (let i = 2; i + 1 < pts.length; i += 2) {
+		if (pts[i] !== pts[0] || pts[i + 1] !== pts[1])
+			return false;
+	}
+	return true;
 }
 
 /** 选区规模校验：超限拒绝，避免一次重建耗时过长。 */
@@ -1662,20 +1747,83 @@ async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>
 			failures.push(`器件 ${label}：系统库/个人库中找不到名为「${p.deviceName}」的器件`);
 			continue;
 		}
+		let made: unknown = null;
 		try {
-			await withTimeout(
-				comp.create(dev, p.x, p.y, p.subPartName, p.rotation, p.mirror, true, true),
+			made = await withTimeout(
+				comp.create(dev, p.x, p.y, p.subPartName, p.rotation, p.mirror, p.addIntoBom !== false, p.addIntoPcb !== false),
 				REBUILD_ONE_TIMEOUT_MS,
 				`重建器件 ${label} 超时`,
 			);
 		}
 		catch (e) {
 			failures.push(`器件 ${label}：${fmtErr(e)}`);
+			continue;
+		}
+		// 属性还原：create() 只给器件默认值（位号是自动编的 R?、值取器件默认），
+		// 原件的位号/显示名/厂商/采购信息/自定义属性都要用 modify 补回去。
+		// ★ modify 的 target 接受 primitiveId 或图元对象：create() 的返回值有时没有 primitiveId
+		//   （实测同一调用有时有有时无，但元件都落页了），所以对象本身也当作 target 传。
+		const mod = (comp as { modify?: (target: unknown, property: Record<string, unknown>) => Promise<unknown> }).modify;
+		if (typeof mod !== 'function')
+			continue;
+		const target = (made && typeof (made as { primitiveId?: unknown }).primitiveId === 'string' && (made as { primitiveId: string }).primitiveId)
+			? (made as { primitiveId: string }).primitiveId
+			: made;
+		if (!target)
+			continue;
+		const props: Record<string, unknown> = {
+			// ★ rotation/mirror 也要在 modify 里再设一次：实测 create(rotation=90) 读回是 270，
+			// 而 modify(rotation=90) 读回就是 90——两者约定不一致。以 modify 的 1:1 口径为准。
+			rotation: p.rotation,
+			mirror: p.mirror,
+			designator: p.designator,
+			name: p.name,
+			manufacturer: p.manufacturer,
+			manufacturerId: p.manufacturerId,
+			supplier: p.supplier,
+			supplierId: p.supplierId,
+			addIntoBom: p.addIntoBom,
+			addIntoPcb: p.addIntoPcb,
+		};
+		if (p.otherProperty && Object.keys(p.otherProperty).length)
+			props.otherProperty = p.otherProperty;
+		// 只提交有值的键：modify 里 undefined 表示「不改」，而传 null 是「清空」——两者语义不同。
+		for (const k of Object.keys(props)) {
+			if (props[k] === undefined)
+				delete props[k];
+		}
+		try {
+			await withTimeout(mod.call(comp, target, props), REBUILD_ONE_TIMEOUT_MS, `还原器件 ${label} 属性超时`);
+		}
+		catch (e) {
+			// 属性还原失败不算重建失败（元件本身已在页上），但要��实告知，否则用户以为属性保住了。
+			failures.push(`器件 ${label}：已放置但属性未完全还原（${fmtErr(e)}）`);
 		}
 	}
 	await sleep(500);
 	// create 的返回值不可靠（实测同一调用有时无 primitiveId 但元件已落页），按数量差计入成功数。
 	rebuilt.parts = Math.max(0, (await countPageContent()).comps - before);
+}
+
+/**
+ * 网络标志 / 网络端口的旋转落定。
+ *
+ * ★ 实测（V4.1.71）`createNetFlag` / `createNetPort` 的 rotation **入参与读回值不一致**：
+ * 传 0→0、180→180 一致，但传 90 读回 270、传 270 读回 90（即 `(360 - 传入) % 360`）。
+ * 器件那边可以用 `modify` 补偿，这里不行——`sch_PrimitiveComponent.modify` 对网络标志/端口
+ * 会报「仅当器件类型为元件时允许使用该函数进行修改」。可用的是 `setState_Rotation` + `done()`，
+ * 实测能把方向正确落定。修正失败不阻断（方向只是显示属性，网络名才是电气语义）。
+ */
+function settlePortLikeRotation(created: unknown, rotation: number): void {
+	const o = created as { setState_Rotation?: (r: number) => void; done?: () => void } | undefined;
+	if (!o || typeof o.setState_Rotation !== 'function')
+		return;
+	try {
+		o.setState_Rotation(rotation);
+		if (typeof o.done === 'function')
+			o.done();
+	}
+	catch { /* 见上：失败不阻断 */ }
 }
 
 async function rebuildFlags(flags: Array<SelectionPortLike>, failures: Array<string>, rebuilt: { netFlags: number }): Promise<void> {
@@ -1696,7 +1844,8 @@ async function rebuildFlags(flags: Array<SelectionPortLike>, failures: Array<str
 			continue;
 		}
 		try {
-			await withTimeout(comp.createNetFlag(kind, f.net, f.x, f.y, f.rotation, f.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络标志 ${f.net} 超时`);
+			const made = await withTimeout(comp.createNetFlag(kind, f.net, f.x, f.y, f.rotation, f.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络标志 ${f.net} 超时`);
+			settlePortLikeRotation(made, f.rotation);
 		}
 		catch (e) {
 			failures.push(`网络标志 ${f.net}：${fmtErr(e)}`);
@@ -1724,7 +1873,8 @@ async function rebuildPorts(ports: Array<SelectionPortLike>, failures: Array<str
 			continue;
 		}
 		try {
-			await withTimeout(comp.createNetPort(dir, p.net, p.x, p.y, p.rotation, p.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络端口 ${p.net} 超时`);
+			const made = await withTimeout(comp.createNetPort(dir, p.net, p.x, p.y, p.rotation, p.mirror), REBUILD_ONE_TIMEOUT_MS, `重建网络端口 ${p.net} 超时`);
+			settlePortLikeRotation(made, p.rotation);
 		}
 		catch (e) {
 			failures.push(`网络端口 ${p.net}：${fmtErr(e)}`);
@@ -1746,17 +1896,13 @@ async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>
 	}
 	const before = (await countPageContent()).wires;
 	for (const w of wires) {
+		// 逐段带 net 建（最初始的写法）。**连通性优先**：不带 net 建会被宿主拒绝（create failed!）
+		// 而丢线，多出的网络标签是可以接受的代价。
 		try {
-			await withTimeout(wire.create(w.line, w.net, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
+			await withTimeout(wire.create(w.line, w.net || undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
 		}
 		catch (e) {
-			// 带网创建失败时重试一次不带网（让走线跟随落点图元的网络），成功则不算失败。
-			try {
-				await withTimeout(wire.create(w.line, undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
-			}
-			catch {
-				failures.push(`走线（${w.net || '无网络'}）：${fmtErr(e)}`);
-			}
+			failures.push(`走线（${w.net || '无网络'}）：${fmtErr(e)}`);
 		}
 	}
 	await sleep(500);

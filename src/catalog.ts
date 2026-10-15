@@ -227,8 +227,16 @@ export async function listWritableLibraries(): Promise<Array<WritableLibrary>> {
 	return resolved
 		.filter((l): l is ResolvedLibrary & { kind: 'personal' | 'team'; uuid: string } =>
 			(l.kind === 'personal' || l.kind === 'team') && typeof l.uuid === 'string' && !!l.uuid)
-		.map(l => ({ kind: l.kind, label: l.label, uuid: l.uuid }))
+		.map(l => ({ kind: l.kind, label: friendlyLibraryLabel(l.kind, l.label), uuid: l.uuid }))
 		.sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9));
+}
+
+/** 宿主不给个人库名字时 label 会退化成 32 位 uuid，卡片上要显示成人话。 */
+function friendlyLibraryLabel(kind: 'personal' | 'team', label: string): string {
+	const text = String(label || '').trim();
+	if (text && !/^[0-9a-f]{32}$/i.test(text))
+		return text;
+	return kind === 'personal' ? '个人库' : '团队库';
 }
 
 /** 单库分页拉全量。page 为 1 起（page 0 恒空）。uuid 去重 + 空页/无新增即停。 */
