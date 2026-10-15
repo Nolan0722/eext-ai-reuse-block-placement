@@ -145,7 +145,6 @@ export interface CreateModuleCardView {
 	name: string;
 	/** AI 建议描述，卡上可改。 */
 	description: string;
-	classification: Array<string>;
 	summary: CreateModuleSummaryView;
 	libraries: Array<CreateModuleLibraryView>;
 	/** 目标库为团队库时置 true，卡上显示「团队成员可见」警示。 */
@@ -762,7 +761,6 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			token,
 			name,
 			description,
-			classification,
 			summary,
 			libraries: libViews,
 			teamVisible: picked.kind === 'team',
@@ -1324,7 +1322,6 @@ export async function confirmEdit(
 export interface CreateModuleEditable {
 	name?: string;
 	description?: string;
-	classification?: Array<string>;
 	libraryKey?: string;
 }
 
@@ -1364,9 +1361,8 @@ export async function confirmCreateModule(
 	if (!name)
 		throw new Error('模块名称不能为空');
 	const description = (typeof editable?.description === 'string' ? editable.description : proposal.description).slice(0, MAX_DESC_LEN);
-	const classification = Array.isArray(editable?.classification)
-		? editable.classification.map(v => String(v).trim()).filter(Boolean)
-		: proposal.classification;
+	// 分类只来自出卡时的提案（卡上没有分类输入框，客户端无从修改）。
+	const classification = proposal.classification;
 	try {
 		const res = await createCbbModuleFromSelection({
 			libraryUuid: target.uuid,

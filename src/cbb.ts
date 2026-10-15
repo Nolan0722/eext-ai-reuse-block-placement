@@ -40,8 +40,8 @@ const DEVICE_LOOKUP_TIMEOUT_MS = 10000;
 /** 单个图元重建（component/wire/flag/port create）。 */
 const REBUILD_ONE_TIMEOUT_MS = 15000;
 /** 选区规模上限：超限直接拒绝，避免一次重建耗时过长。 */
-export const MAX_CREATE_PARTS = 300;
-export const MAX_CREATE_WIRES = 1000;
+const MAX_CREATE_PARTS = 300;
+const MAX_CREATE_WIRES = 1000;
 /** 选中集超出此数时不在卡上逐个列位号，只给计数。 */
 export const SELECTION_DESIGNATOR_LIMIT = 20;
 /** EDMT_EditorDocumentType：原理图页 / PCB / 面板，对应 sch|pcb|pnl_Document.save。 */
@@ -1249,7 +1249,6 @@ export interface SelectionPart {
 	// ── 以下为「属性保真」：create() 只会给器件默认值，位号/值/采购信息等都要靠 modify 事后还原 ──
 	/** 显示名表达式（如 `={Value}` / `={Manufacturer Part}`）。 */
 	name?: string;
-	uniqueId?: string;
 	manufacturer?: string;
 	manufacturerId?: string;
 	supplier?: string;
@@ -1269,7 +1268,7 @@ export interface SelectionPart {
 const NON_PORTABLE_PROPERTY_KEYS = new Set(['Device', 'Symbol', 'Footprint', 'Reuse Block', 'Group ID', 'Channel ID']);
 
 /** 过滤出可跨工程携带的属性（只留标量值；引用类键见 NON_PORTABLE_PROPERTY_KEYS）。 */
-export function pickCarryOverProperties(raw: unknown): Record<string, string | number | boolean> {
+function pickCarryOverProperties(raw: unknown): Record<string, string | number | boolean> {
 	const out: Record<string, string | number | boolean> = {};
 	if (!raw || typeof raw !== 'object')
 		return out;
@@ -1310,14 +1309,12 @@ export interface SelectionSnapshot {
 	netPorts: Array<SelectionPortLike>;
 	/** 选区里被跳过的图元类型（文字/图形/离图连接器等），仅在卡上提示。 */
 	unsupported: Array<string>;
-	/** 选区图元 id。 */
+	/** 选区图元 id（空选区判定用）。 */
 	primitiveIds: Array<string>;
-	/** id 排序拼接的指纹：confirm 时复核画布未漂移。 */
-	fingerprint: string;
 }
 
 function emptySnapshot(): SelectionSnapshot {
-	return { parts: [], wires: [], netFlags: [], netPorts: [], unsupported: [], primitiveIds: [], fingerprint: '' };
+	return { parts: [], wires: [], netFlags: [], netPorts: [], unsupported: [], primitiveIds: [] };
 }
 
 /**
@@ -1326,7 +1323,7 @@ function emptySnapshot(): SelectionSnapshot {
  * 后缀是**类型标签不是网络名**（用 net='ZZTEST' 建过，读回仍是 AGND/PGND），故可确定映射。
  * ★ 必须先判 AnalogGround / ProtectGround 再判 Ground，否则都被 `Ground` 前缀抢先命中。
  */
-export function parseNetFlagKind(componentName: string): 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround' | null {
+function parseNetFlagKind(componentName: string): 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround' | null {
 	const n = (componentName || '').trim();
 	if (n.startsWith('Power'))
 		return 'Power';
@@ -1344,14 +1341,10 @@ export function parseNetFlagKind(componentName: string): 'Power' | 'Ground' | 'A
  * 网络端口方向解析：实测 createNetPort 传入 IN/OUT/BI → 读回 `Netport-IN` / `Netport-OUT` / `Netport-BI`。
  * 同时接受裸的 IN/OUT/BI（宿主若改变命名仍可用）；不做宽松后缀匹配，避免 'PIN' 之类被误判成 IN。
  */
-export function parseNetPortDirection(componentName: string): 'IN' | 'OUT' | 'BI' | null {
+function parseNetPortDirection(componentName: string): 'IN' | 'OUT' | 'BI' | null {
 	const n = (componentName || '').trim();
 	const bare = n.startsWith('Netport-') ? n.slice('Netport-'.length).toUpperCase() : n.toUpperCase();
 	return bare === 'IN' || bare === 'OUT' || bare === 'BI' ? bare : null;
-}
-
-function pageFingerprint(ids: Array<string>): string {
-	return [...ids].sort().join('\u0001');
 }
 
 /**
@@ -1386,7 +1379,6 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 
 	const snap = emptySnapshot();
 	snap.primitiveIds = ids;
-	snap.fingerprint = pageFingerprint(ids);
 	const read = (o: Record<string, unknown>, k: string): unknown => {
 		try {
 			const fn = o?.[k];
@@ -1438,7 +1430,6 @@ export async function readSelectionSnapshot(): Promise<SelectionSnapshot> {
 					symbolName,
 					subPartName: typeof sub === 'string' && sub ? sub : undefined,
 					name: str('getState_Name'),
-					uniqueId: str('getState_UniqueId'),
 					manufacturer: str('getState_Manufacturer'),
 					manufacturerId: str('getState_ManufacturerId'),
 					supplier: str('getState_Supplier'),
@@ -1787,11 +1778,8 @@ async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>
 		};
 		if (p.otherProperty && Object.keys(p.otherProperty).length)
 			props.otherProperty = p.otherProperty;
-		// 只提交有值的键：modify 里 undefined 表示「不改」，而传 null 是「清空」——两者语义不同。
-		for (const k of Object.keys(props)) {
-			if (props[k] === undefined)
-				delete props[k];
-		}
+		// 未取到的字段保持 undefined 直接传：modify 把 undefined 当「不改」，与不传该键等价
+		// （对象过 JSON 时 undefined 值的键本来也会被丢弃），故无需预先剔除。
 		try {
 			await withTimeout(mod.call(comp, target, props), REBUILD_ONE_TIMEOUT_MS, `还原器件 ${label} 属性超时`);
 		}
@@ -1884,6 +1872,38 @@ async function rebuildPorts(ports: Array<SelectionPortLike>, failures: Array<str
 	rebuilt.netPorts = Math.max(0, (await countPageContent()).comps - before);
 }
 
+/**
+ * 隐藏走线上的网络名标签。
+ *
+ * 实测（V4.1.71）：`create(line, net, …)` 传了 net 时，宿主会给走线挂一条
+ * `key='Name'`、`value=<网络名>`、`valueVisible=true` 的属性——画布上就是那个蓝标签。
+ * 该属性**删不掉**（`sch_PrimitiveAttribute.delete` 实测返回 false、属性仍在），
+ * 但可以置 `valueVisible=false` 隐藏：这正是原图里 Symbol/Footprint/Device 这类内部引用的
+ * 状态（页面源码里 42 处 `valueVisible:false` 全是这类不显示的内部字段）。
+ *
+ * 用 `getAll(wireId)` 一次拿到该走线的全部属性（不逐个 get，省往返），再对可见的那条置 false。
+ * 隐藏失败不阻断重建——标签只是显示问题，线的连通性不受影响。
+ */
+async function hideWireNetLabel(wireId: string): Promise<void> {
+	const api = edaGlobal()?.sch_PrimitiveAttribute as
+		| {
+			getAll?: (parentPrimitiveId?: string) => Promise<Array<Record<string, unknown>>>;
+			modify?: (target: unknown, property: Record<string, unknown>) => Promise<unknown>;
+		}
+		| undefined;
+	if (typeof api?.getAll !== 'function' || typeof api.modify !== 'function')
+		return;
+	try {
+		const attrs = (await withTimeout(api.getAll(wireId), DEVICE_LOOKUP_TIMEOUT_MS, '读取走线属性超时')) || [];
+		for (const attr of Array.isArray(attrs) ? attrs : []) {
+			if (!attr || attr.valueVisible !== true)
+				continue;
+			await withTimeout(api.modify(attr, { valueVisible: false }), DEVICE_LOOKUP_TIMEOUT_MS, '隐藏网络标签超时');
+		}
+	}
+	catch { /* 见上：不阻断 */ }
+}
+
 async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>, rebuilt: { wires: number }): Promise<void> {
 	if (!wires.length)
 		return;
@@ -1897,13 +1917,19 @@ async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>
 	const before = (await countPageContent()).wires;
 	for (const w of wires) {
 		// 逐段带 net 建（最初始的写法）。**连通性优先**：不带 net 建会被宿主拒绝（create failed!）
-		// 而丢线，多出的网络标签是可以接受的代价。
+		// 而丢线。多出的网络标签在建完后隐藏掉（见 hideWireNetLabel），不靠省掉 net 来避标签。
+		let made: unknown = null;
 		try {
-			await withTimeout(wire.create(w.line, w.net || undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
+			made = await withTimeout(wire.create(w.line, w.net || undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
 		}
 		catch (e) {
 			failures.push(`走线（${w.net || '无网络'}）：${fmtErr(e)}`);
+			continue;
 		}
+		// 只有传了 net 才会有那条可见标签；create 的��回值有时没有 primitiveId，拿不到就跳过隐藏。
+		const id = made && typeof (made as { primitiveId?: unknown }).primitiveId === 'string' ? String((made as { primitiveId: string }).primitiveId) : '';
+		if (w.net && id)
+			await hideWireNetLabel(id);
 	}
 	await sleep(500);
 	rebuilt.wires = Math.max(0, (await countPageContent()).wires - before);

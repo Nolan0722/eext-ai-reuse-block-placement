@@ -781,12 +781,6 @@
       await sleep(700);
       return { ok: true, fileName: 'cbb-catalog-mock.json', stats: MOCK_CATALOG.stats };
     },
-    async confirmCreateModule(_sid, token) {
-      if (!mockOpenTokens.has(token)) throw new Error('确认卡无效或已过期，请重新发起。');
-      mockOpenTokens.delete(token);
-      await sleep(900);
-      return { ok: true, cbbUuid: 'mock-cbb-uuid', name: '演示模块', libraryLabel: '个人库', rebuilt: { parts: 3, wires: 2, netFlags: 1, netPorts: 0 } };
-    },
     cancelCard(_sid, token) { mockOpenTokens.delete(token); },
     resetChatSession() { mockOpenTokens.clear(); },
     async selfCheck() {
