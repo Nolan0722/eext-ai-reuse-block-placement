@@ -85,12 +85,9 @@
   /* 首段以 AI 内容开头时（欢迎语/状态提示）给顶部留一点呼吸，用户气泡开头则贴住 header */
   .seg:first-child .col.ai:first-child, .seg:first-child .sysnote:first-child{ padding-top:12px; }
   .bubble{width:100%; padding:9px 13px; border-radius:12px; word-break:break-word;}
-  /* 用户气泡可点击：收起/展开（展开态由 JS 渲染全文，收起态由 JS 只渲染首个逻辑行） */
+  /* 用户气泡可点击：点击定位到该消息所在分段的顶部（不折叠，全文常显） */
   .bubble.user{background:var(--selected); color:var(--text); border:1px solid var(--line-3); cursor:pointer;}
   .bubble.user:hover{border-color:var(--blue-line);}
-  /* 用户气泡收起态：单行省略。首个逻辑行由 JS 截取，此处仅负责单行内超宽的截断显示
-     （nowrap+ellipsis，不依赖 -webkit-line-clamp，规避内核差异） */
-  .bubble.user.fold{white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
   .ai-body b{color:inherit; font-weight:700;}
   .caret{display:inline-block;width:7px;height:14px;background:var(--blue);
     vertical-align:-2px; margin-left:2px; animation:blink 1s steps(2) infinite;}
@@ -871,26 +868,15 @@
       if (detail && detail.textContent) tool.classList.toggle('open');
     }
   });
-  /* ── 点击用户气泡：收起/展开该条消息（收起仅显第一个逻辑行，解决多行长文本占据空间）。
-     收起/展开由 JS 按原始文本重渲染（dataset.raw 存原文），不依赖 line-clamp 类内核特性；
-     单行内超出气泡宽度再由 CSS nowrap+ellipsis 截断。
-     含换行或超长（>120 字）的消息生成时默认收起，其余默认展开。 ── */
-  function renderUserBubble(b, folded) {
-    const raw = b.dataset.raw || '';
-    b.classList.toggle('fold', folded);
-    if (folded) {
-      const norm = raw.replace(/\r\n?/g, '\n');
-      const nl = norm.indexOf('\n');
-      const first = (nl >= 0 ? norm.slice(0, nl) : norm).trim();
-      b.textContent = first + ((nl >= 0 || norm.length > first.length) ? '…' : '');
-    } else {
-      b.textContent = raw;
-    }
-  }
+  /* ── 点击消息：定位到该消息所在分段的顶部（滚动到视口顶，配合段内 sticky 用户气泡吸顶）。
+     旧版这里是「点击收起/展开」折叠，已移除——不再折叠，只做定位。 ── */
   msgList.addEventListener('click', e => {
-    const bubble = e.target.closest('.bubble.user');
-    if (!bubble || !msgList.contains(bubble)) return;
-    renderUserBubble(bubble, !bubble.classList.contains('fold'));
+    /* 交互控件（卡片按钮/工具行/输入框等）有各自的点击行为，不触发定位 */
+    if (e.target.closest('button, input, select, textarea, a, .card, .tool')) return;
+    const seg = e.target.closest('.seg');
+    if (!seg || !msgList.contains(seg)) return;
+    const top = seg.getBoundingClientRect().top - msgList.getBoundingClientRect().top + msgList.scrollTop;
+    msgList.scrollTo({ top, behavior: 'smooth' });
   });
   function addUserMsg(text) {
     $('#page-chat').classList.remove('empty'); /* 首条消息后隐藏空会话首屏 */
@@ -900,10 +886,9 @@
     const plain = String(text || '');
     const b = document.createElement('div');
     b.className = 'bubble user';
-    b.title = '点击收起/展开';
-    b.dataset.raw = plain;
+    b.title = '点击定位到本段顶部';
+    b.textContent = plain;
     c.appendChild(b);
-    renderUserBubble(b, /\n/.test(plain.trim()) || plain.length > 120);
     seg.appendChild(c); scrollBottom();
   }
   function addNote(text) {

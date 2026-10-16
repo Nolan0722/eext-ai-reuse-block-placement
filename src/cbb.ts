@@ -37,6 +37,8 @@ const CREATE_TIMEOUT_MS = 30000;
 const OPEN_MODULE_TIMEOUT_MS = 30000;
 /** lib_Device.search：按元件名回库找器件对象（重建元件用）。 */
 const DEVICE_LOOKUP_TIMEOUT_MS = 10000;
+/** 引脚/属性等小批量读操作的超时（每次只读一个器件，不需要长预算）。 */
+const PIN_READ_TIMEOUT_MS = 8000;
 /** 单个图元重建（component/wire/flag/port create）。 */
 const REBUILD_ONE_TIMEOUT_MS = 15000;
 /** 选区规模上限：超限直接拒绝，避免一次重建耗时过长。 */
@@ -1510,6 +1512,520 @@ export function assertSelectionSize(snap: SelectionSnapshot): void {
 		throw new Error(`选中的走线过多（${snap.wires.length} 条，上限 ${MAX_CREATE_WIRES}）。请缩小选择范围后重试。`);
 }
 
+// ── 给 agent 的只读能力：读整页原理图 + 操作选区 ──────────────────────────
+//
+// 这两件事都**不改文档**：read 只读；select 只改画布的选中状态，不新建/删除/移动任何图元。
+// 所以它们直接进 AGENT_TOOLS，**不走确认卡令牌**——令牌那套是给「改画布 / 写库 / 写文件」把关的。
+
+/** 页面上单个元件的紧凑条目。 */
+export interface PageComponent {
+	/** 图元 id（选中/取消选中时传给 select_primitives）。 */
+	id: string;
+	/** 器件用位号；网络标志/端口用其网络名。 */
+	designator: string;
+	kind: 'part' | 'netflag' | 'netport' | 'other';
+	/** 库器件型号（如 ESP32-C3-WROOM-02-N4）。仅 part 有。 */
+	device?: string;
+	value?: string;
+	footprint?: string;
+	x: number;
+	y: number;
+}
+
+/** 页面上的一条走线（逻辑走线，不是分段）。 */
+export interface PageWire {
+	id: string;
+	line: Array<number> | Array<Array<number>>;
+	/** 走线上**存储**的 net（多为空串，网络靠连接推导）。 */
+	net: string;
+}
+
+/** 网络 → 挂在该网络上的引脚。这是 agent 判断"哪些器件属于同一功能块"最需要的形态。 */
+export interface PageNet {
+	net: string;
+	/** `位号.引脚名`，如 `U5.IO7`。 */
+	pins: Array<string>;
+}
+
+export interface SchematicReadResult {
+	pageUuid: string;
+	pageName: string;
+	components: Array<PageComponent>;
+	wires: Array<PageWire>;
+	/** 按网络聚合的连通性（仅列有 ≥1 个引脚的）。 */
+	nets: Array<PageNet>;
+	/** 未解析出网络的引脚数：未接线，或几何推导的缺口。 */
+	unresolvedPinCount: number;
+	/** 走线上可见的网络标签（valueVisible=true 的 Name 属性）按值去重计数。 */
+	wireLabels: Array<{ value: string; count: number }>;
+}
+
+const NET_KEY = (x: number, y: number): string => `${x},${y}`;
+
+/**
+ * 由几何推导「坐标点 → 网络名」。
+ *
+ * 为什么自己算：`sch_Net.getAllNets/getAllNetsName/getNet` 实测在 V4.1.71 上**恒返回空**
+ * （5 个页面验证过），`sch_Netlist.getNetlist()` 则**挂起不返回**（>25s）。所以连通性只能自己推。
+ *
+ * 做法：把「坐标点」当节点建图，同一条走线的相邻点相连（坐标相同的点自然重合）；
+ * 种子 = ①网络标志/端口的位置 + 其 `getState_Name()`（★它们的网络名在 Name 里，
+ * `getState_Net()` 对 netflag/netport 返回空串）②走线自身 `getState_Net()` 非空者。
+ * 再用并查集把网络名传播到整个连通分量。实测 120 个引脚能解析出 96 个（80%），
+ * 未解析的是真的没接线的引脚。
+ */
+async function buildPageNetMap(): Promise<(x: number, y: number) => string | undefined> {
+	const parent = new Map<string, string>();
+	const find = (a: string): string => {
+		let cur = a;
+		let next = parent.get(cur);
+		while (next !== undefined && next !== cur) {
+			cur = next;
+			next = parent.get(cur);
+		}
+		return cur;
+	};
+	const union = (a: string, b: string): void => {
+		if (!parent.has(a))
+			parent.set(a, a);
+		if (!parent.has(b))
+			parent.set(b, b);
+		const ra = find(a);
+		const rb = find(b);
+		if (ra !== rb)
+			parent.set(ra, rb);
+	};
+
+	const seeds: Array<{ pt: string; net: string }> = [];
+	const root = edaGlobal() || {};
+	const wireApi = root.sch_PrimitiveWire as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	let wires: Array<Record<string, unknown>> = [];
+	try {
+		wires = (typeof wireApi?.getAll === 'function' ? await wireApi.getAll() : []) || [];
+	}
+	catch { wires = []; }
+	for (const w of Array.isArray(wires) ? wires : []) {
+		const pts = flattenWireLine(readPrimitiveStateOf(w, 'getState_Line'));
+		const net = String(readPrimitiveStateOf(w, 'getState_Net') ?? '');
+		for (let i = 0; i + 1 < pts.length; i += 2) {
+			const k = NET_KEY(pts[i], pts[i + 1]);
+			if (!parent.has(k))
+				parent.set(k, k);
+			if (i + 2 < pts.length)
+				union(k, NET_KEY(pts[i + 2], pts[i + 3]));
+			if (net)
+				seeds.push({ pt: k, net });
+		}
+	}
+	const compApi = root.sch_PrimitiveComponent as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	let comps: Array<Record<string, unknown>> = [];
+	try {
+		comps = (typeof compApi?.getAll === 'function' ? await compApi.getAll() : []) || [];
+	}
+	catch { comps = []; }
+	for (const c of Array.isArray(comps) ? comps : []) {
+		const t = String(readPrimitiveStateOf(c, 'getState_ComponentType') ?? '');
+		if (t !== 'netflag' && t !== 'netport')
+			continue;
+		const net = String(readPrimitiveStateOf(c, 'getState_Name') ?? '');
+		const k = NET_KEY(Number(readPrimitiveStateOf(c, 'getState_X')), Number(readPrimitiveStateOf(c, 'getState_Y')));
+		if (!parent.has(k))
+			parent.set(k, k);
+		if (net)
+			seeds.push({ pt: k, net });
+	}
+
+	const rootNet = new Map<string, string>();
+	for (const s of seeds) {
+		const r = find(s.pt);
+		if (!rootNet.has(r))
+			rootNet.set(r, s.net);
+	}
+	return (x: number, y: number): string | undefined => {
+		const k = NET_KEY(x, y);
+		if (!parent.has(k))
+			return undefined;
+		return rootNet.get(find(k));
+	};
+}
+
+/** 鸭子类型读图元状态（readSelectionSnapshot 内的同名局部函数在此处的模块级版本）。 */
+function readPrimitiveStateOf(o: Record<string, unknown>, k: string): unknown {
+	try {
+		const fn = o?.[k];
+		return typeof fn === 'function' ? (fn as () => unknown).call(o) : undefined;
+	}
+	catch { return undefined; }
+}
+
+/** 取某元件全部引脚的坐标。 */
+async function readComponentPins(componentId: string): Promise<Array<{ name: string; number: string; x: number; y: number }>> {
+	const api = edaGlobal()?.sch_PrimitiveComponent as
+		| { getAllPinsByPrimitiveId?: (id: string) => Promise<unknown> }
+		| undefined;
+	if (typeof api?.getAllPinsByPrimitiveId !== 'function')
+		return [];
+	try {
+		const rows = await withTimeout(api.getAllPinsByPrimitiveId(componentId), PIN_READ_TIMEOUT_MS, '读取引脚超时');
+		const arr = Array.isArray(rows) ? rows : ((rows as { pins?: Array<Record<string, unknown>> } | undefined)?.pins ?? []);
+		return (Array.isArray(arr) ? arr : [])
+			.map(p => ({
+				name: String(p?.pinName ?? ''),
+				number: String(p?.pinNumber ?? ''),
+				x: Number(p?.x),
+				y: Number(p?.y),
+			}))
+			.filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+	}
+	catch { return []; }
+}
+
+/** 当前活动文档的页名（读不到就留空）。 */
+async function readCurrentPageName(): Promise<string> {
+	try {
+		const sch = edaGlobal()?.dmt_Schematic as { getCurrentSchematicPageInfo?: () => Promise<{ name?: string } | null> } | undefined;
+		const p = typeof sch?.getCurrentSchematicPageInfo === 'function' ? await sch.getCurrentSchematicPageInfo() : null;
+		return p && typeof p.name === 'string' ? p.name : '';
+	}
+	catch { return ''; }
+}
+
+/**
+ * 读当前原理图页的**全部信息**：元件清单、走线、按网络聚合的连通性、走线网络标签。
+ * 只读，不改画布。非原理图页抛错。
+ *
+ * 体量提醒：器件数 × 一次引脚读取。156 元件的图实测约 0.3–0.5s（页内调用，不过桥）。
+ */
+export async function readSchematicPage(): Promise<SchematicReadResult> {
+	const state = await getCurrentDocState();
+	if (!state.ok)
+		throw new Error('当前活动文档不是原理图页。请先切换到原理图页。');
+
+	const compApi = edaGlobal()?.sch_PrimitiveComponent as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	let rawComps: Array<Record<string, unknown>> = [];
+	try {
+		rawComps = (typeof compApi?.getAll === 'function' ? await compApi.getAll() : []) || [];
+	}
+	catch (e) {
+		throw new Error(`读取器件列表失败：${fmtErr(e)}`);
+	}
+
+	const components: Array<PageComponent> = [];
+	for (const c of Array.isArray(rawComps) ? rawComps : []) {
+		const type = String(readPrimitiveStateOf(c, 'getState_ComponentType') ?? '');
+		if (type === 'sheet')
+			continue;
+		const dev = readPrimitiveStateOf(c, 'getState_Component') as { name?: unknown } | undefined;
+		const fp = readPrimitiveStateOf(c, 'getState_Footprint') as { name?: unknown } | undefined;
+		const other = readPrimitiveStateOf(c, 'getState_OtherProperty') as Record<string, unknown> | undefined;
+		const value = other && typeof other.Value === 'string' ? other.Value : undefined;
+		const kind: PageComponent['kind'] = type === 'part' || type === 'netflag' || type === 'netport' ? type : 'other';
+		const netName = String(readPrimitiveStateOf(c, 'getState_Name') ?? '');
+		components.push({
+			id: String(c.primitiveId ?? ''),
+			designator: kind === 'part' ? String(readPrimitiveStateOf(c, 'getState_Designator') ?? '') : netName,
+			kind,
+			device: dev && typeof dev.name === 'string' && dev.name ? dev.name : undefined,
+			value,
+			footprint: fp && typeof fp.name === 'string' && fp.name ? fp.name : undefined,
+			x: Number(readPrimitiveStateOf(c, 'getState_X')),
+			y: Number(readPrimitiveStateOf(c, 'getState_Y')),
+		});
+	}
+
+	const wireApi = edaGlobal()?.sch_PrimitiveWire as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	let rawWires: Array<Record<string, unknown>> = [];
+	try {
+		rawWires = (typeof wireApi?.getAll === 'function' ? await wireApi.getAll() : []) || [];
+	}
+	catch { rawWires = []; }
+	const wires: Array<PageWire> = (Array.isArray(rawWires) ? rawWires : []).map(w => ({
+		id: String(w.primitiveId ?? ''),
+		line: readPrimitiveStateOf(w, 'getState_Line') as Array<number> | Array<Array<number>>,
+		net: String(readPrimitiveStateOf(w, 'getState_Net') ?? ''),
+	}));
+
+	// 连通性：引脚 → 网络
+	const netAt = await buildPageNetMap();
+	const netPins = new Map<string, Array<string>>();
+	let unresolvedPinCount = 0;
+	for (const comp of components) {
+		if (comp.kind !== 'part' && comp.kind !== 'netflag' && comp.kind !== 'netport')
+			continue;
+		const pins = await readComponentPins(comp.id);
+		for (const pin of pins) {
+			const net = netAt(pin.x, pin.y);
+			if (!net) {
+				unresolvedPinCount++;
+				continue;
+			}
+			const key = `${comp.designator || comp.id}.${pin.name || pin.number || '?'}`;
+			const list = netPins.get(net);
+			if (list)
+				list.push(key);
+			else
+				netPins.set(net, [key]);
+		}
+	}
+	const nets: Array<PageNet> = [...netPins.entries()]
+		.map(([net, pins]) => ({ net, pins }))
+		.sort((a, b) => b.pins.length - a.pins.length);
+
+	// 走线上的可见网络标签（蓝色 Name 文字）：选中导线时会自动带入，这里显式列出供 agent 知晓
+	const attrApi = edaGlobal()?.sch_PrimitiveAttribute as
+		| {
+			getAllPrimitiveId?: (parentId?: string) => Promise<Array<string>>;
+			getAll?: (parentId?: string) => Promise<Array<Record<string, unknown>>>;
+		}
+		| undefined;
+	const labelCount = new Map<string, number>();
+	if (typeof attrApi?.getAll === 'function') {
+		for (const w of wires) {
+			try {
+				const attrs = (await withTimeout(attrApi.getAll(w.id), PIN_READ_TIMEOUT_MS, '读取走线属性超时')) || [];
+				for (const a of Array.isArray(attrs) ? attrs : []) {
+					if (a?.valueVisible !== true)
+						continue;
+					const v = String(a.value ?? '');
+					if (v)
+						labelCount.set(v, (labelCount.get(v) || 0) + 1);
+				}
+			}
+			catch { /* 单条读失败跳过 */ }
+		}
+	}
+	return {
+		pageUuid: state.uuid || '',
+		pageName: await readCurrentPageName(),
+		components,
+		wires,
+		nets,
+		unresolvedPinCount,
+		wireLabels: [...labelCount.entries()].map(([value, count]) => ({ value, count })),
+	};
+}
+
+/** 选区操作模式。 */
+export type SelectMode = 'replace' | 'add' | 'remove' | 'clear';
+
+/** 读当前选区里所有图元的 id。 */
+async function readSelectedIds(): Promise<Array<string>> {
+	const sel = edaGlobal()?.sch_SelectControl as
+		| { getAllSelectedPrimitives?: () => Promise<Array<Record<string, unknown>>> }
+		| undefined;
+	if (typeof sel?.getAllSelectedPrimitives !== 'function')
+		return [];
+	try {
+		const rows = (await withTimeout(sel.getAllSelectedPrimitives(), 15000, '读取选区超时')) || [];
+		return (Array.isArray(rows) ? rows : []).map(o => String(o?.primitiveId ?? '')).filter(Boolean);
+	}
+	catch { return []; }
+}
+
+/**
+ * 操作画布选区。**只改选中状态，不动任何图元**。
+ *
+ * `doSelectPrimitives` 只支持"选中"、没有"取消"参数，所以 add/remove 都是
+ * 「读当前选区 → 求并/差 → 清空 → 重选」实现。
+ */
+export async function selectPrimitives(ids: Array<string>, mode: SelectMode = 'replace'): Promise<{ selected: number }> {
+	const sel = edaGlobal()?.sch_SelectControl as
+		| { doSelectPrimitives?: (ids: Array<string>) => Promise<unknown>; clearSelected?: () => Promise<unknown> }
+		| undefined;
+	if (typeof sel?.doSelectPrimitives !== 'function' || typeof sel.clearSelected !== 'function')
+		throw new Error('sch_SelectControl 不可用（宿主版本过低或不支持）');
+
+	if (mode === 'clear') {
+		await withTimeout(sel.clearSelected(), 15000, '清空选区超时');
+		return { selected: 0 };
+	}
+
+	const wanted = ids.filter(id => typeof id === 'string' && id);
+	let next = wanted;
+	if (mode === 'add' || mode === 'remove') {
+		const current = await readSelectedIds();
+		const set = new Set(current);
+		if (mode === 'add') {
+			for (const id of wanted)
+				set.add(id);
+		}
+		else {
+			for (const id of wanted)
+				set.delete(id);
+		}
+		next = [...set];
+	}
+
+	await withTimeout(sel.clearSelected(), 15000, '清空选区超时');
+	if (next.length)
+		await withTimeout(sel.doSelectPrimitives(next), 20000, '选中图元超时');
+	// 回读确认（宿主可能只选中了其中一部分，如逻辑走线 → 分段）
+	const actual = await readSelectedIds();
+	return { selected: actual.length };
+}
+
+export interface SelectModuleBySeedResult {
+	seed: string;
+	members: Array<{ designator: string; device: string; value?: string }>;
+	portCount: number;
+	wireCount: number;
+	labelCount: number;
+	selectedTotal: number;
+	/** 区域包围盒（0.01 英寸），供 agent 了解范围。 */
+	region: { minX: number; minY: number; maxX: number; maxY: number };
+}
+
+/**
+ * 以指定元件为**种子**，空间聚类出它所在的模块并选中。
+ *
+ * 判据（2026-10-15 真机验证，纯几何、**不用网络**）：
+ * ① 种子 = agent 指定的元件（按位号或图元 id 找）
+ * ② 空间聚类：单链，与集合内任一成员距离 ≤ linkDistance（默认 120）
+ * ③ 区域 = **成员器件全部引脚坐标**的包围盒 + 边距 margin（默认 120）
+ *    ★ 必须用引脚坐标而不是器件中心点：109 引脚的大芯片（如 LTE 模组）引脚跨度
+ *      远超中心点，用中心点会漏掉贴边的走线与标签（实测 4G_USB_D± 就是这样漏的）。
+ * ④ 网络端口/标志：坐标落在区域内
+ * ⑤ 走线：两端锚定模块引脚/端口坐标，或整条落在区域内
+ * ⑥ 网络标签：区域内走线上 valueVisible=true 的 Name 属性（选导线时本会带入，显式收集是兜底）
+ *
+ * 已知边界：模块之间空间紧密相邻时（如"显示屏↔MCU电源"、"扬声器↔按键组"）会**过度合并**，
+ * 因为"本模块的去耦电容"和"隔壁模块的支撑件"在几何上同型（都挨着、都只连电源）。
+ * 真机 15 个模块实测 10 个一次分对，失败全部集中在这类碰撞区。返回值给出成员清单，
+ * 供 agent 用器件类型语义再判一次边界。
+ */
+export async function selectModuleBySeed(seed: string, opts?: { linkDistance?: number; margin?: number }): Promise<SelectModuleBySeedResult> {
+	const link = typeof opts?.linkDistance === 'number' && opts.linkDistance > 0 ? opts.linkDistance : 120;
+	const margin = typeof opts?.margin === 'number' && opts.margin > 0 ? opts.margin : 120;
+	const state = await getCurrentDocState();
+	if (!state.ok)
+		throw new Error('当前活动文档不是原理图页。请先切换到原理图页。');
+
+	const compApi = edaGlobal()?.sch_PrimitiveComponent as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	const rawComps = (typeof compApi?.getAll === 'function' ? await compApi.getAll() : []) || [];
+	interface Cand { id: string; des: string; device: string; value?: string; x: number; y: number; type: string }
+	const all: Array<Cand> = (Array.isArray(rawComps) ? rawComps : [])
+		.map((c) => {
+			const dev = readPrimitiveStateOf(c, 'getState_Component') as { name?: unknown } | undefined;
+			const other = readPrimitiveStateOf(c, 'getState_OtherProperty') as Record<string, unknown> | undefined;
+			return {
+				id: String(c.primitiveId ?? ''),
+				des: String(readPrimitiveStateOf(c, 'getState_Designator') ?? ''),
+				device: dev && typeof dev.name === 'string' ? dev.name : '',
+				value: other && typeof other.Value === 'string' ? other.Value : undefined,
+				x: Number(readPrimitiveStateOf(c, 'getState_X')),
+				y: Number(readPrimitiveStateOf(c, 'getState_Y')),
+				type: String(readPrimitiveStateOf(c, 'getState_ComponentType') ?? ''),
+			};
+		})
+		.filter(c => c.id && Number.isFinite(c.x) && Number.isFinite(c.y));
+
+	const seedKey = seed.trim();
+	const seedCand = all.find(c => c.id === seedKey)
+		|| all.find(c => c.type === 'part' && c.des === seedKey)
+		|| all.find(c => c.device === seedKey);
+	if (!seedCand)
+		throw new Error(`页面上找不到种子元件「${seed}」。请用 read_schematic 拿到准确的位号或图元 id。`);
+
+	// ② 空间聚类（单链）
+	const parts = all.filter(c => c.type === 'part');
+	const near: Array<Cand> = [seedCand];
+	let grew = true;
+	while (grew) {
+		grew = false;
+		for (const p of parts) {
+			if (near.includes(p))
+				continue;
+			if (near.some(n => Math.hypot(p.x - n.x, p.y - n.y) <= link)) {
+				near.push(p);
+				grew = true;
+			}
+		}
+	}
+
+	// ③ 区域：成员器件**引脚坐标**的包围盒
+	const pinList: Array<{ x: number; y: number }> = [];
+	for (const m of near) {
+		for (const p of await readComponentPins(m.id))
+			pinList.push({ x: p.x, y: p.y });
+	}
+	if (!pinList.length) {
+		for (const m of near)
+			pinList.push({ x: m.x, y: m.y });
+	}
+	const region = {
+		minX: Math.min(...pinList.map(p => p.x)) - margin,
+		maxX: Math.max(...pinList.map(p => p.x)) + margin,
+		minY: Math.min(...pinList.map(p => p.y)) - margin,
+		maxY: Math.max(...pinList.map(p => p.y)) + margin,
+	};
+	const inRegion = (x: number, y: number): boolean => x >= region.minX && x <= region.maxX && y >= region.minY && y <= region.maxY;
+
+	// ④ 网络端口 / 标志
+	const ports = all.filter(c => (c.type === 'netflag' || c.type === 'netport') && inRegion(c.x, c.y));
+
+	// ⑤ 走线
+	const wireApi = edaGlobal()?.sch_PrimitiveWire as { getAll?: () => Promise<Array<Record<string, unknown>>> } | undefined;
+	const rawWires = (typeof wireApi?.getAll === 'function' ? await wireApi.getAll() : []) || [];
+	const anchors = new Set(pinList.map(p => NET_KEY(p.x, p.y)));
+	for (const p of ports)
+		anchors.add(NET_KEY(p.x, p.y));
+	const wireIds: Array<string> = [];
+	for (const w of Array.isArray(rawWires) ? rawWires : []) {
+		const flat = flattenWireLine(readPrimitiveStateOf(w, 'getState_Line'));
+		if (flat.length < 4)
+			continue;
+		const endsAnchored = anchors.has(NET_KEY(flat[0], flat[1]))
+			&& anchors.has(NET_KEY(flat[flat.length - 2], flat[flat.length - 1]));
+		let allInside = true;
+		for (let i = 0; i + 1 < flat.length; i += 2) {
+			if (!inRegion(flat[i], flat[i + 1])) {
+				allInside = false;
+				break;
+			}
+		}
+		if (endsAnchored || allInside) {
+			const id = String(w.primitiveId ?? '');
+			if (id)
+				wireIds.push(id);
+		}
+	}
+
+	// ⑥ 网络标签（区域内走线上可见的 Name 属性）
+	const attrApi = edaGlobal()?.sch_PrimitiveAttribute as
+		| { getAll?: (parentId?: string) => Promise<Array<Record<string, unknown>>> }
+		| undefined;
+	const labelIds: Array<string> = [];
+	if (typeof attrApi?.getAll === 'function') {
+		for (const wid of wireIds) {
+			try {
+				const attrs = (await withTimeout(attrApi.getAll(wid), PIN_READ_TIMEOUT_MS, '读取走线属性超时')) || [];
+				for (const a of Array.isArray(attrs) ? attrs : []) {
+					if (a?.valueVisible === true && String(a.value ?? '') && typeof a.primitiveId === 'string')
+						labelIds.push(a.primitiveId);
+				}
+			}
+			catch { /* 单条读失败跳过 */ }
+		}
+	}
+
+	const ids = near.map(m => m.id).concat(ports.map(p => p.id)).concat(wireIds).concat(labelIds);
+	const { selected } = await selectPrimitives(ids, 'replace');
+	return {
+		seed: `${seedCand.des || seedCand.device}（${seedCand.device || seedCand.type}）`,
+		members: near.map(m => ({ designator: m.des, device: m.device, value: m.value })),
+		portCount: ports.length,
+		wireCount: wireIds.length,
+		labelCount: labelIds.length,
+		selectedTotal: selected,
+		region: {
+			minX: Math.round(region.minX),
+			minY: Math.round(region.minY),
+			maxX: Math.round(region.maxX),
+			maxY: Math.round(region.maxY),
+		},
+	};
+}
+
 /**
  * 按器件名回库取器件对象：search(名, 库) 后取 name **精确匹配**的那条。
  * 实测 search 会返回模糊命中的其它器件（如搜 'Res_0603' 首条是 'YFT0603X103F3950FA'），
@@ -1660,6 +2176,19 @@ export async function createCbbModuleFromSelection(params: CreateCbbModuleParams
 		const saved = await withTimeout(doc.save(), SAVE_TIMEOUT_MS, '保存模块超时（20s）');
 		if (saved !== true)
 			throw new Error('保存模块失败（接口返回 false）');
+		// ★ 保存后必须再清扫：宿主在**保存时**才把相邻分段合并成逻辑走线，并给合并后的线
+		//   重新聚合网络名标签（实测 0 → 8 复现）。保存前的清扫因此必然被推翻一部分。
+		// 保存→清扫→再保存，迭代到无可见标签（上限 3 轮；实测 2 轮内收敛）。
+		for (let round = 0; round < 3; round++) {
+			const remaining = await hideAllWireNetLabels();
+			if (!remaining)
+				break;
+			await sleep(800);
+			const resaved = await withTimeout(doc.save(), SAVE_TIMEOUT_MS, '保存模块超时（20s）');
+			if (resaved !== true)
+				break;
+			await sleep(1200);
+		}
 	}
 	catch (e) {
 		// 模块已建成但内容写入失败：回滚删除，避免库里留空壳。删除失败只记录不覆盖原错误。
@@ -1720,6 +2249,18 @@ async function countPageContent(): Promise<{ comps: number; wires: number }> {
 	return { comps, wires };
 }
 
+/** 当前页全部元件 id 集合（create 的返回值不可靠，用前后差值定位新落页元件）。 */
+async function allPartIds(): Promise<Set<string>> {
+	const api = edaGlobal()?.sch_PrimitiveComponent as { getAllPrimitiveId?: () => Promise<Array<string>> } | undefined;
+	if (typeof api?.getAllPrimitiveId !== 'function')
+		return new Set();
+	try {
+		const rows = (await withTimeout(api.getAllPrimitiveId(), PIN_READ_TIMEOUT_MS, '读取元件列表超时')) || [];
+		return new Set((Array.isArray(rows) ? rows : []).filter((x): x is string => typeof x === 'string' && !!x));
+	}
+	catch { return new Set(); }
+}
+
 async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>, rebuilt: { parts: number }): Promise<void> {
 	if (!parts.length)
 		return;
@@ -1738,9 +2279,11 @@ async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>
 			failures.push(`器件 ${label}：系统库/个人库中找不到名为「${p.deviceName}」的器件`);
 			continue;
 		}
-		let made: unknown = null;
+		// create 的返回值不可靠（有时无 primitiveId 但元件已落页）——用集合差值找新元件的 id，
+		// 后续 modify / 引用改写都依赖这个 id。
+		const beforeIds = await allPartIds();
 		try {
-			made = await withTimeout(
+			await withTimeout(
 				comp.create(dev, p.x, p.y, p.subPartName, p.rotation, p.mirror, p.addIntoBom !== false, p.addIntoPcb !== false),
 				REBUILD_ONE_TIMEOUT_MS,
 				`重建器件 ${label} 超时`,
@@ -1750,42 +2293,34 @@ async function rebuildParts(parts: Array<SelectionPart>, failures: Array<string>
 			failures.push(`器件 ${label}：${fmtErr(e)}`);
 			continue;
 		}
+		const partId = [...(await allPartIds())].find(x => !beforeIds.has(x)) || '';
 		// 属性还原：create() 只给器件默认值（位号是自动编的 R?、值取器件默认），
 		// 原件的位号/显示名/厂商/采购信息/自定义属性都要用 modify 补回去。
-		// ★ modify 的 target 接受 primitiveId 或图元对象：create() 的返回值有时没有 primitiveId
-		//   （实测同一调用有时有有时无，但元件都落页了），所以对象本身也当作 target 传。
 		const mod = (comp as { modify?: (target: unknown, property: Record<string, unknown>) => Promise<unknown> }).modify;
-		if (typeof mod !== 'function')
-			continue;
-		const target = (made && typeof (made as { primitiveId?: unknown }).primitiveId === 'string' && (made as { primitiveId: string }).primitiveId)
-			? (made as { primitiveId: string }).primitiveId
-			: made;
-		if (!target)
-			continue;
-		const props: Record<string, unknown> = {
-			// ★ rotation/mirror 也要在 modify 里再设一次：实测 create(rotation=90) 读回是 270，
-			// 而 modify(rotation=90) 读回就是 90——两者约定不一致。以 modify 的 1:1 口径为准。
-			rotation: p.rotation,
-			mirror: p.mirror,
-			designator: p.designator,
-			name: p.name,
-			manufacturer: p.manufacturer,
-			manufacturerId: p.manufacturerId,
-			supplier: p.supplier,
-			supplierId: p.supplierId,
-			addIntoBom: p.addIntoBom,
-			addIntoPcb: p.addIntoPcb,
-		};
-		if (p.otherProperty && Object.keys(p.otherProperty).length)
-			props.otherProperty = p.otherProperty;
-		// 未取到的字段保持 undefined 直接传：modify 把 undefined 当「不改」，与不传该键等价
-		// （对象过 JSON 时 undefined 值的键本来也会被丢弃），故无需预先剔除。
-		try {
-			await withTimeout(mod.call(comp, target, props), REBUILD_ONE_TIMEOUT_MS, `还原器件 ${label} 属性超时`);
-		}
-		catch (e) {
-			// 属性还原失败不算重建失败（元件本身已在页上），但要��实告知，否则用户以为属性保住了。
-			failures.push(`器件 ${label}：已放置但属性未完全还原（${fmtErr(e)}）`);
+		if (typeof mod === 'function' && partId) {
+			const props: Record<string, unknown> = {
+				// ★ rotation/mirror 也要在 modify 里再设一次：实测 create(rotation=90) 读回是 270，
+				// 而 modify(rotation=90) 读回就是 90——两者约定不一致。以 modify 的 1:1 口径为准。
+				rotation: p.rotation,
+				mirror: p.mirror,
+				designator: p.designator,
+				name: p.name,
+				manufacturer: p.manufacturer,
+				manufacturerId: p.manufacturerId,
+				supplier: p.supplier,
+				supplierId: p.supplierId,
+				addIntoBom: p.addIntoBom,
+				addIntoPcb: p.addIntoPcb,
+			};
+			if (p.otherProperty && Object.keys(p.otherProperty).length)
+				props.otherProperty = p.otherProperty;
+			// 未取到的字段保持 undefined 直接传：modify 把 undefined 当「不改」，与不传该键等价。
+			try {
+				await withTimeout(mod.call(comp, partId, props), REBUILD_ONE_TIMEOUT_MS, `还原器件 ${label} 属性超时`);
+			}
+			catch {
+				failures.push(`器件 ${label}：已放置但属性未完全还原`);
+			}
 		}
 	}
 	await sleep(500);
@@ -1873,35 +2408,49 @@ async function rebuildPorts(ports: Array<SelectionPortLike>, failures: Array<str
 }
 
 /**
- * 隐藏走线上的网络名标签。
+ * 收尾清扫：隐藏模块页内**所有**走线的可见网络名标签，返回隐藏数量。
  *
- * 实测（V4.1.71）：`create(line, net, …)` 传了 net 时，宿主会给走线挂一条
- * `key='Name'`、`value=<网络名>`、`valueVisible=true` 的属性——画布上就是那个蓝标签。
- * 该属性**删不掉**（`sch_PrimitiveAttribute.delete` 实测返回 false、属性仍在），
- * 但可以置 `valueVisible=false` 隐藏：这正是原图里 Symbol/Footprint/Device 这类内部引用的
- * 状态（页面源码里 42 处 `valueVisible:false` 全是这类不显示的内部字段）。
- *
- * 用 `getAll(wireId)` 一次拿到该走线的全部属性（不逐个 get，省往返），再对可见的那条置 false。
- * 隐藏失败不阻断重建——标签只是显示问题，线的连通性不受影响。
+ * 为什么不能"建一条隐藏一条"（2026-10-16 SC8721 模块实测教训）：
+ * - 读选区拿到的是**分段**，每段各自 create 并带 net → **每段各自生成一条 Name 标签**；
+ * - 宿主随后把相邻分段**合并**成逻辑走线，标签也聚合到合并后的线上（实测一条线上
+ *   聚了 6 个 VBUS、8 个 O_-）；逐段创建时隐藏的时机**早于合并**，等于白做——
+ *   82 条可见标签只压住了 GND/PVCC 等未参与合并的少数几条。
+ * 所以在全部走线建完、合并落定之后统一扫一遍：遍历页内所有走线，
+ * 把 valueVisible=true 的属性置 false。网络标志/端口是独立器件，不在清扫范围。
  */
-async function hideWireNetLabel(wireId: string): Promise<void> {
-	const api = edaGlobal()?.sch_PrimitiveAttribute as
+async function hideAllWireNetLabels(): Promise<number> {
+	const attrApi = edaGlobal()?.sch_PrimitiveAttribute as
 		| {
 			getAll?: (parentPrimitiveId?: string) => Promise<Array<Record<string, unknown>>>;
 			modify?: (target: unknown, property: Record<string, unknown>) => Promise<unknown>;
 		}
 		| undefined;
-	if (typeof api?.getAll !== 'function' || typeof api.modify !== 'function')
-		return;
+	const wireApi = edaGlobal()?.sch_PrimitiveWire as
+		| { getAll?: () => Promise<Array<Record<string, unknown>>> }
+		| undefined;
+	if (typeof attrApi?.getAll !== 'function' || typeof attrApi.modify !== 'function' || typeof wireApi?.getAll !== 'function')
+		return 0;
+	let hidden = 0;
 	try {
-		const attrs = (await withTimeout(api.getAll(wireId), DEVICE_LOOKUP_TIMEOUT_MS, '读取走线属性超时')) || [];
-		for (const attr of Array.isArray(attrs) ? attrs : []) {
-			if (!attr || attr.valueVisible !== true)
+		const wires = (await withTimeout(wireApi.getAll(), DEVICE_LOOKUP_TIMEOUT_MS, '读取模块走线超时')) || [];
+		for (const w of Array.isArray(wires) ? wires : []) {
+			const wid = String(w?.primitiveId ?? '');
+			if (!wid)
 				continue;
-			await withTimeout(api.modify(attr, { valueVisible: false }), DEVICE_LOOKUP_TIMEOUT_MS, '隐藏网络标签超时');
+			const attrs = (await withTimeout(attrApi.getAll(wid), DEVICE_LOOKUP_TIMEOUT_MS, '读取走线属性超时')) || [];
+			for (const a of Array.isArray(attrs) ? attrs : []) {
+				if (!a || a.valueVisible !== true)
+					continue;
+				try {
+					await withTimeout(attrApi.modify(a, { valueVisible: false }), DEVICE_LOOKUP_TIMEOUT_MS, '隐藏网络标签超时');
+					hidden++;
+				}
+				catch { /* 单条失败不阻断清扫 */ }
+			}
 		}
 	}
-	catch { /* 见上：不阻断 */ }
+	catch { /* 清扫失败不阻断建模块——标签只是显示问题 */ }
+	return hidden;
 }
 
 async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>, rebuilt: { wires: number }): Promise<void> {
@@ -1917,22 +2466,17 @@ async function rebuildWires(wires: Array<SelectionWire>, failures: Array<string>
 	const before = (await countPageContent()).wires;
 	for (const w of wires) {
 		// 逐段带 net 建（最初始的写法）。**连通性优先**：不带 net 建会被宿主拒绝（create failed!）
-		// 而丢线。多出的网络标签在建完后隐藏掉（见 hideWireNetLabel），不靠省掉 net 来避标签。
-		let made: unknown = null;
+		// 而丢线。多出的网络标签由收尾的 hideAllWireNetLabels 统一清扫，不在这里逐条隐藏。
 		try {
-			made = await withTimeout(wire.create(w.line, w.net || undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
+			await withTimeout(wire.create(w.line, w.net || undefined, w.color, w.lineWidth, w.lineType), REBUILD_ONE_TIMEOUT_MS, '重建走线超时');
 		}
 		catch (e) {
 			failures.push(`走线（${w.net || '无网络'}）：${fmtErr(e)}`);
-			continue;
 		}
-		// 只有传了 net 才会有那条可见标签；create 的��回值有时没有 primitiveId，拿不到就跳过隐藏。
-		const id = made && typeof (made as { primitiveId?: unknown }).primitiveId === 'string' ? String((made as { primitiveId: string }).primitiveId) : '';
-		if (w.net && id)
-			await hideWireNetLabel(id);
 	}
-	await sleep(500);
+	await sleep(800);
 	rebuilt.wires = Math.max(0, (await countPageContent()).wires - before);
+	await hideAllWireNetLabels();
 }
 
 /** 摘要里的单行器件：位号 d / 画布名 n / 库器件名 dev / 封装名 fp。 */

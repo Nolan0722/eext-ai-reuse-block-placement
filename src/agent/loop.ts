@@ -9,7 +9,7 @@ import type { HistoryTurn } from './llm';
 import type { CatalogStoreRecord, FlatModule } from './store';
 import type { AgentToolName } from './tools';
 import { listWritableLibraries } from '../catalog';
-import { activateSchematicPage, assertSelectionSize, cacheGeometry, collectPageObstacles, createCbbModuleFromSelection, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary, readSelectionSnapshot, SELECTION_DESIGNATOR_LIMIT } from '../cbb';
+import { activateSchematicPage, assertSelectionSize, cacheGeometry, collectPageObstacles, createCbbModuleFromSelection, DEFAULT_PAGE_WIDTH, estimateGeometry, getCurrentDocState, loadGeometry, modifyCbbModule, parsePlaceTarget, placeCbbModule, planAlignedPlacement, premeasureGeometry, readCbbSchematicSummary, readSchematicPage, readSelectionSnapshot, SELECTION_DESIGNATOR_LIMIT, selectModuleBySeed, selectPrimitives } from '../cbb';
 import { runSelfCheck } from '../env';
 import { edaGlobal } from '../host';
 import { getJevSettings, getLlmSettings, getPlacementSettings, getStylePrompt } from '../settings';
@@ -21,6 +21,8 @@ import { AGENT_TOOL_NAMES, MAX_DESC_LEN } from './tools';
 
 /** 单条消息最多发起的模型调用轮数（每轮 = 思考 + 可选工具执行；工具结果驱动下一轮）。 */
 const MAX_AGENT_ROUNDS = 12;
+/** 端点补全上限截断（finish_reason=length / stop_reason=max_tokens）时的可见提示。 */
+const TRUNCATION_NOTE = '\n\n（注意：本轮输出达到了端点的输出上限而被截断，思考与回复可能不完整。可在 设置 → 模型接入 更换输出上限更高的模型，或把任务拆小后再试。）';
 /** 单轮对话工具调用总量上限（Round ≠ Tool Call：模型一轮可返回多个调用，需独立限制防异常循环）。 */
 const MAX_TOOL_CALLS = 48;
 const MAX_HISTORY = 12;
@@ -209,6 +211,13 @@ interface ChatSession {
 	cards: Map<string, CardRecord>;
 	/** 本会话内已成功做过原理图分析的模块 uuid（给编辑卡打"已分析"标记）。 */
 	analyzed: Set<string>;
+	/**
+	 * 本轮对话内刚执行过自动选中（select_module / select_primitives）。
+	 * propose_create_module 据此拦截：AI 自动选中的选区**未经用户核对**，直接出卡
+	 * 会把选错的内容送进库。必须等用户下一条消息（核对/调整/确认）后才放行——
+	 * 标志在每轮 chatTurn 开始时清除，即「同一轮内选完直接出卡被拒，跨轮放行」。
+	 */
+	agentSelected: boolean;
 }
 
 const sessions = new Map<string, ChatSession>();
@@ -216,7 +225,7 @@ const sessions = new Map<string, ChatSession>();
 function sessionOf(id: string): ChatSession {
 	let s = sessions.get(id);
 	if (!s) {
-		s = { history: [], cards: new Map(), analyzed: new Set() };
+		s = { history: [], cards: new Map(), analyzed: new Set(), agentSelected: false };
 		sessions.set(id, s);
 	}
 	return s;
@@ -701,6 +710,13 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 			result: { ok: false, error },
 		});
 		const label = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : '(未命名)';
+		// ★ 同轮拦截：本轮刚执行过自动选中（select_module / select_primitives）时，选区尚未
+		//   经用户核对，直接出卡会把选错的内容送进库。必须先结束回复提醒用户核对，
+		//   用户下一条消息（标志在 chatTurn 开始时清除）之后才允许出卡。
+		if (s.agentSelected) {
+			const error = '本次选区刚由自动选中生成，尚未经用户核对，不能直接出示建模块确认卡。请立即结束本轮回复：说明已按聚类选中并提醒用户在画布上核对（漏掉的图元手动补选、混入的器件手动取消），待用户下一条消息确认后再调用 propose_create_module。';
+			return { event: { name: 'propose_create_module', argsSummary: label, status: 'err', error }, result: { ok: false, error, needUserConfirm: true } };
+		}
 		let snapshot: SelectionSnapshot;
 		try {
 			snapshot = await readSelectionSnapshot();
@@ -775,6 +791,60 @@ const TOOL_HANDLERS: Record<AgentToolName, ToolHandler> = {
 				hint: '已出示建模块确认卡，等待用户确认后才会写库。同一条回复里请告知用户：确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。',
 			},
 		};
+	},
+	read_schematic: async (_s, _args) => {
+		try {
+			const page = await readSchematicPage();
+			return {
+				event: { name: 'read_schematic', argsSummary: page.pageName || '当前页', status: 'ok', detail: { components: page.components.length, wires: page.wires.length, nets: page.nets.length } },
+				result: page,
+			};
+		}
+		catch (e) {
+			const error = e instanceof Error ? e.message : String(e);
+			return { event: { name: 'read_schematic', argsSummary: '当前页', status: 'err', error }, result: { ok: false, error } };
+		}
+	},
+	select_module: async (s, args) => {
+		const seed = String(args.seed || '').trim();
+		const label = seed || '(未指定)';
+		try {
+			const res = await selectModuleBySeed(seed, {
+				linkDistance: typeof args.linkDistance === 'number' ? args.linkDistance : undefined,
+				margin: typeof args.margin === 'number' ? args.margin : undefined,
+			});
+			// 自动选中的选区未经用户核对：置标志拦截同轮内的 propose_create_module。
+			s.agentSelected = true;
+			return {
+				event: { name: 'select_module', argsSummary: label, status: 'ok', detail: { members: res.members.length, selected: res.selectedTotal } },
+				result: { ...res, hint: '请在回复末尾提醒用户：以上是按空间距离聚出的粗略边界，请在画布上核对选区——漏掉的图元请手动补选，混入的邻居器件请手动取消选择，确认无误后再继续后续操作。' },
+			};
+		}
+		catch (e) {
+			const error = e instanceof Error ? e.message : String(e);
+			return { event: { name: 'select_module', argsSummary: label, status: 'err', error }, result: { ok: false, error } };
+		}
+	},
+	select_primitives: async (s, args) => {
+		const mode = args.mode === 'add' || args.mode === 'remove' || args.mode === 'clear' ? args.mode : 'replace';
+		const ids = Array.isArray(args.ids) ? args.ids.map(v => String(v)).filter(Boolean) : [];
+		if (mode !== 'clear' && !ids.length) {
+			const error = `mode=${mode} 需要提供 ids（图元 id 清单，来自 read_schematic）。`;
+			return { event: { name: 'select_primitives', argsSummary: mode, status: 'err', error }, result: { ok: false, error } };
+		}
+		try {
+			const res = await selectPrimitives(ids, mode);
+			// 任何 AI 驱动的选区改动都置标志：选区未经用户核对前不许直接出建模块卡。
+			s.agentSelected = true;
+			return {
+				event: { name: 'select_primitives', argsSummary: `${mode}×${ids.length}`, status: 'ok', detail: { selected: res.selected } },
+				result: { ok: true, mode, requested: ids.length, ...res, hint: mode === 'clear' ? undefined : '请在回复末尾提醒用户：选区已更新，请在画布上核对——漏掉的图元请手动补选，不需要的图元请手动取消选择。核对确认后（用户下一条消息）才能调 propose_create_module 出卡。' },
+			};
+		}
+		catch (e) {
+			const error = e instanceof Error ? e.message : String(e);
+			return { event: { name: 'select_primitives', argsSummary: mode, status: 'err', error }, result: { ok: false, error } };
+		}
 	},
 	propose_placement: async (s, args) => {
 		const rec = await loadModelCatalogRecord();
@@ -897,6 +967,8 @@ export async function chatTurn(
 ): Promise<ChatTurnResult> {
 	const text = redactSecrets((userText || '').trim());
 	const s = sessionOf(sessionId);
+	// 新的用户消息 = 用户有了核对选区的机会：解除「选中后禁止直接出建模块卡」的拦截。
+	s.agentSelected = false;
 	const tools: Array<ChatToolEvent> = [];
 	const cards: Array<ChatCardView> = [];
 	let gotoSettings = false;
@@ -978,6 +1050,9 @@ export async function chatTurn(
 			// STREAM_SENTINEL：流式路径已完成（载荷经 acc 拼装）；否则为缓冲完整 JSON。
 			const streamed = data === STREAM_SENTINEL;
 			const parsed = streamed ? acc.result() : parseAgentResponse(settings.provider, data);
+			// 端点补全上限截断必须可见：截断时思考与正文都可能不完整，无声中断会让用户以为模型只说这么多。
+			if (parsed.truncated)
+				emit({ type: 'text_delta', delta: TRUNCATION_NOTE, round });
 			if (!streamed) {
 				// 缓冲路径没走过增量回调：整段一次性补发，UI 渲染口径与流式一致。
 				if (parsed.reasoning)
@@ -986,7 +1061,7 @@ export async function chatTurn(
 					emit({ type: 'text_delta', delta: parsed.text, round });
 			}
 			if (!parsed.toolCalls.length) {
-				const assistantText = redactSecrets(parsed.text || '（模型没有返回文本）');
+				const assistantText = redactSecrets(parsed.text || '（模型没有返回文本）') + (parsed.truncated ? TRUNCATION_NOTE : '');
 				s.history.push({ role: 'assistant', content: assistantText });
 				const finalResult: ChatTurnResult = { assistantText, tools, cards, gotoSettings, llmConfigured: true };
 				emit({ type: 'final', result: finalResult });
@@ -1120,6 +1195,12 @@ function summarizeToolArgs(name: string, args: Record<string, unknown>): string 
 			return Array.isArray(args.picks) ? `${args.picks.length} 个候选` : '候选';
 		case 'propose_create_module':
 			return String(args.name || '').trim() || '新建复用模块';
+		case 'read_schematic':
+			return '读当前页';
+		case 'select_module':
+			return String(args.seed || '').trim() || '聚类选中';
+		case 'select_primitives':
+			return String(args.mode || 'replace');
 		case 'propose_export':
 			return Array.isArray(args.cbbUuids) && args.cbbUuids.length ? `按需导出 ${args.cbbUuids.length} 项` : '全量导出确认卡';
 		case 'compact_history':

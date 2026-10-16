@@ -16,6 +16,9 @@ export interface ParsedAgentResponse {
 	toolCalls: Array<ParsedToolCall>;
 	/** 思维链文本（reasoning/thinking），未开启或端点未返回时为空串。 */
 	reasoning: string;
+	/** 端点因达到补全上限而截断（finish_reason=length / stop_reason=max_tokens）。
+	 *  截断时思考与正文都可能不完整，必须让用户看见而不是无声中断。 */
+	truncated?: boolean;
 }
 
 export interface HistoryTurn {
@@ -133,12 +136,14 @@ export function buildAgentRequest(
 	if (settings.provider === 'anthropic') {
 		const url = anthropicEndpoint(base);
 		// Anthropic 思考模式无条件开启：thinking 块与 temperature 互斥，须去掉 temperature；
-		// budget 设为较大值以兼容默认 max_tokens 4096（budget 必须大于 max_tokens 才有意义，端点会自动裁剪）。
+		// budget 设为较大值以兼容默认 max_tokens（budget 必须小于 max_tokens 才有意义，端点会自动裁剪）。
+		// ★ 思考预算不能太小：4096 token ≈ 2500-3000 汉字，复杂任务（如规划一次模块识别）轻松超出，
+		//   超出即思考被预算掐断。16384 给足余量，max_tokens 同步放大保持 budget < max_tokens。
 		const body: Record<string, unknown> = {
 			model: settings.model.trim(),
-			max_tokens: 8192,
+			max_tokens: 32768,
 			stream: true,
-			thinking: { type: 'enabled', budget_tokens: 4096 },
+			thinking: { type: 'enabled', budget_tokens: 16384 },
 			system: systemPrompt,
 			messages: toAnthropicMessages(history),
 			tools: toolsAnthropic(),
@@ -159,11 +164,15 @@ export function buildAgentRequest(
 	}
 	// OpenAI Chat 兼容格式：DeepSeek-R1 的 reasoning_content、Qwen3 的 reasoning 随 delta 增量返回，
 	// 无需额外请求参数（思考模型按 model 名路由；Qwen3 系需 enable_thinking 时由流式路径天然满足）。
+	// ★ max_tokens 必须显式给：不传时端点走默认补全上限（DeepSeek 默认 4k），思考模型先花预算，
+	//   长思考顶到上限会被截断（finish_reason=length）。8192 是国内主流端点的安全上限
+	//   （DeepSeek-chat 上限恰为 8192；GLM/Qwen 均 ≥ 8192），不发的端点默认值普遍更小。
 	return {
 		url: joinUrl(base, '/chat/completions'),
 		body: JSON.stringify({
 			model: settings.model.trim(),
 			temperature: 0,
+			max_tokens: 8192,
 			stream: true,
 			messages: toOpenAiChatMessages(systemPrompt, history),
 			tools: toolsOpenAiChat(),
@@ -235,6 +244,8 @@ export class StreamAccumulator {
 	/** Anthropic：tool_use 块按 index 累积 partial_json。 */
 	private anCalls = new Map<number, { id: string; name: string; args: string }>();
 	private anOrder: Array<number> = [];
+	/** 端点因达到补全上限而截断（finish_reason=length / stop_reason=max_tokens）。 */
+	private truncated = false;
 
 	/** 喂入一条 SSE data 载荷（JSON 文本），返回本次追加的正文/思维链增量。无法解析的载荷静默忽略（keep-alive 等）。 */
 	feed(provider: LlmSettings['provider'], data: string): { textDelta: string; reasoningDelta: string } {
@@ -261,6 +272,8 @@ export class StreamAccumulator {
 		const choice = Array.isArray(d?.choices) ? d.choices[0] : null;
 		if (!choice)
 			return;
+		if (choice.finish_reason === 'length')
+			this.truncated = true;
 		const delta = choice.delta ?? {};
 		if (typeof delta.reasoning_content === 'string')
 			this.reasoning += delta.reasoning_content;
@@ -328,6 +341,9 @@ export class StreamAccumulator {
 				}
 			}
 		}
+		else if (d.response?.incomplete_details?.reason === 'max_output_tokens' || d.response?.status === 'incomplete') {
+			this.truncated = true;
+		}
 	}
 
 	private feedAnthropic(d: Record<string, any>): void {
@@ -354,6 +370,9 @@ export class StreamAccumulator {
 					slot.args += dl.partial_json;
 			}
 		}
+		else if (type === 'message_delta' && d.delta?.stop_reason === 'max_tokens') {
+			this.truncated = true;
+		}
 	}
 
 	/** 流结束后汇总；toolCalls 保证按出现顺序。 */
@@ -371,7 +390,7 @@ export class StreamAccumulator {
 			const c = this.anCalls.get(idx)!;
 			toolCalls.push({ id: c.id || `tool_${idx}`, name: c.name, arguments: parseArgs(c.args) });
 		}
-		return { text: this.text, toolCalls, reasoning: this.reasoning };
+		return { text: this.text, toolCalls, reasoning: this.reasoning, truncated: this.truncated };
 	}
 }
 
@@ -386,7 +405,7 @@ export function parseAgentResponse(provider: LlmSettings['provider'], data: unkn
 			name: String(i.name || ''),
 			arguments: parseArgs(i.input),
 		}));
-		return { text, toolCalls, reasoning };
+		return { text, toolCalls, reasoning, truncated: d.stop_reason === 'max_tokens' };
 	}
 	if (provider === 'openai-responses') {
 		const d = data as Record<string, any>;
@@ -409,7 +428,12 @@ export function parseAgentResponse(provider: LlmSettings['provider'], data: unkn
 			name: String(i.name || ''),
 			arguments: parseArgs(i.arguments),
 		}));
-		return { text, toolCalls, reasoning };
+		return {
+			text,
+			toolCalls,
+			reasoning,
+			truncated: d?.status === 'incomplete' || d?.incomplete_details?.reason === 'max_output_tokens',
+		};
 	}
 	const d = data as Record<string, any>;
 	const msg = d?.choices?.[0]?.message || {};
@@ -421,5 +445,5 @@ export function parseAgentResponse(provider: LlmSettings['provider'], data: unkn
 		name: String(c.function?.name || c.name || ''),
 		arguments: parseArgs(c.function?.arguments ?? c.arguments),
 	}));
-	return { text, toolCalls, reasoning };
+	return { text, toolCalls, reasoning, truncated: d?.choices?.[0]?.finish_reason === 'length' };
 }

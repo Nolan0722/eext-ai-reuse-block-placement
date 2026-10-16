@@ -13,6 +13,7 @@ export const MAX_DESC_LEN = 300;
  *   - 描述 ≤300 字：规则 9 ↔ PROPOSE_EDIT_PARAMS 描述与 MAX_DESC_LEN 运行时校验
  *   - 导出按需口径：规则 10 ↔ PROPOSE_EXPORT_PARAMS/propose_export 描述
  *   - 建模块来源与目标库：规则 12 ↔ PROPOSE_CREATE_MODULE_PARAMS 的 libraryKind 描述
+ *   - 读图与选区工具：规则 13 ↔ read_schematic / select_module / select_primitives 描述
  * - 风格与限制（默认可被设置页覆盖）：需求要多具体才检索、回复风格。不写进工具描述，避免盖住用户自定义。
  */
 export const AGENT_WORKFLOW_PROMPT = [
@@ -30,6 +31,7 @@ export const AGENT_WORKFLOW_PROMPT = [
 	'10. 需要导出目录时调用 propose_export（另存一份 JSON，不含工程文件）。导出按需：用户要导出特定模块或当前方案时，把要导出的 cbbUuids 传入（逐字取自检索/推荐结果）；仅当用户明确说导出全部目录时才省略参数（卡会列出全部模块）。',
 	'11. 对话较长（上下文摘要显示轮数超过 8）或发现缺少早期对话中的约定/结果时，调用 compact_history 折叠早期对话：summary 写入自足的中文摘要（用户的要求与约束、已完成/进行中的事项、已达成的决定）；最近几轮会原样保留，不影响当前任务。',
 	'12. 用户要求把原理图上选中的内容存成复用模块时，直接调用 propose_create_module 出确认卡，不要先追问元件清单——插件会自己读选区。name/description 基于工具返回的选区摘要给出；目标库按用户的话推断（说了「团队库」才传 libraryKind=team，否则 personal），用户可在卡上改。同一条回复的正文里要告诉用户：确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。若工具回报选区为空，说明用户还没选中内容，请提示其先在原理图上选中元件再试。',
+	'13. 涉及「当前原理图」的任务（如「把主控存成模块」「看看这张图有什么」）用 read_schematic 读页 → select_module（按种子聚类选中）或 select_primitives（直接选/剔除）组织选区 → 再调 propose_create_module（它读取当前选区）。select 系列只改选中状态。select_module 的聚类距离默认 120（偏紧），**由你负责调**：核对返回的成员清单——核心芯片缺去耦电容/上拉（明显缺件）就调大 linkDistance 重试（160/200），邻居模块的器件混进来就保持或调小、改用 select_primitives(mode=remove) 剔除；按器件类型语义判边界（电源芯片/去耦电容/输入输出器件）。**选中后禁止在同一条回复里调 propose_create_module**（工具会拦截）：必须先结束回复提醒用户在画布上核对选区——漏掉的图元手动补选、混入的器件手动取消——用户下一条消息确认后再调 propose_create_module 出卡。例外：用户在本条消息之前就已手动框选好选区时，可直接出卡。不要向用户询问坐标或图元 id——都从 read_schematic 拿。',
 ].join('\n');
 
 /** 两套可填入设置页的系统提示词。未保存时使用严谨简短。文案不出现工具名。 */
@@ -167,6 +169,33 @@ const REFRESH_CATALOG_PARAMS = {
 	properties: {},
 } as const;
 
+const READ_SCHEMATIC_PARAMS = {
+	type: 'object',
+	additionalProperties: false,
+	properties: {},
+} as const;
+
+const SELECT_MODULE_PARAMS = {
+	type: 'object',
+	additionalProperties: false,
+	properties: {
+		seed: { type: 'string', description: '中心元件：页面上的位号（如 U5）或图元 id。先用 read_schematic 拿到准确值。工具以它为种子做空间聚类，圈出所在模块并选中。' },
+		linkDistance: { type: 'number', description: '聚类距离阈值（0.01 英寸），默认 120。**由你主动调整**：返回的成员明显缺件（如电源芯片没带去耦电容、芯片没带上拉）时调大重试（如 160/200）；邻居模块的器件被并进来时调小。' },
+		margin: { type: 'number', description: '区域边距（0.01 英寸），默认 120。调大能收进贴边的网络标签，但过大会把邻居模块的端口也收进来。' },
+	},
+	required: ['seed'],
+} as const;
+
+const SELECT_PRIMITIVES_PARAMS = {
+	type: 'object',
+	additionalProperties: false,
+	properties: {
+		ids: { type: 'array', items: { type: 'string' }, description: '图元 id 列表（来自 read_schematic 的 components[].id / wires[].id，或 select_module 返回的选区回读）。mode=clear 时忽略。' },
+		mode: { type: 'string', enum: ['replace', 'add', 'remove', 'clear'], description: 'replace=选中这些（替换当前选区）；add=加入当前选区；remove=从当前选区移除；clear=清空选区。' },
+	},
+	required: ['mode'],
+} as const;
+
 const EMPTY_PARAMS = { type: 'object', properties: {}, additionalProperties: false } as const;
 
 const COMPACT_HISTORY_PARAMS = {
@@ -191,7 +220,10 @@ export const AGENT_TOOLS = [
 	{ name: 'propose_placement', description: '向用户出示放置确认卡（不会真正放置）。选出匹配模块并给出放置形式（符号或图页）与位置（当前图页 / 新建图页 / 新建板子 / 新建工程）。落点由插件自动排布，无需坐标。', parameters: PROPOSE_PLACEMENT_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'inspect_module', description: '读取模块（个人库/团队库/本地库）自带原理图页的内容摘要：器件清单（位号/名称/器件名/封装）、网络名、文字标注。只读不改画布（优先读工程内已有副本；否则经临时板物化读取，读取后自动删除临时内容）。用于在改名称/描述前自动分析模块功能。', parameters: INSPECT_MODULE_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'propose_edit', description: '向用户出示模块名称/描述编辑确认卡（不会真正写库）。', parameters: PROPOSE_EDIT_PARAMS as unknown as Record<string, unknown> },
-	{ name: 'propose_create_module', description: '把用户在原理图上**当前选中**的内容（器件、走线、网络标志、网络端口）创建为一个新的复用模块并写入目标库。仅在用户明确要求「把选中的存成模块 / 建个复用模块」时调用。本工具只读取画布选区并出示确认卡，不会写库；真正写库在用户点确认后发生。不要传元件名或 uuid——来源就是画布选区，插件自己读。确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。', parameters: PROPOSE_CREATE_MODULE_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'propose_create_module', description: '把用户在原理图上**当前选中**的内容（器件、走线、网络标志、网络端口）创建为一个新的复用模块并写入目标库。仅在用户明确要求「把选中的存成模块 / 建个复用模块」时调用。本工具只读取画布选区并出示确认卡，不会写库；真正写库在用户点确认后发生。不要传元件名或 uuid——来源就是画布选区，插件自己读。确认后会先保存当前图页，并短暂切换到新建的模块工程，完成后自动切回原工程。。★ 若本轮刚用 select_module / select_primitives 改过选区，本工具会拒绝出卡（选区未经用户核对）——先结束回复提醒用户核对，用户下一条消息确认后再调用', parameters: PROPOSE_CREATE_MODULE_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'read_schematic', description: '读取当前原理图页的全部信息：元件清单（位号/型号/值/封装/坐标）、走线（几何与存储网络）、按网络聚合的连通性（网络→引脚列表）、走线上的可见网络标签。只读，不改画布。要在当前图上找模块、分析电路结构、或给 select 系列工具拿图元 id 时调用。注意返回体量大，一轮对话内不要反复调用；连通性由几何推导，未接线的引脚不会出现在 nets 里（unresolvedPinCount 是它们的总数）。', parameters: READ_SCHEMATIC_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'select_module', description: '以指定元件为种子，按空间聚类选中它所在的整块电路（器件 + 网络端口/标志 + 内部走线 + 网络标签），并保持选中。只改选中状态，不创建/删除/移动任何图元，也不写库。seed 用 read_schematic 返回的位号或型号。聚类距离默认 120（偏紧），**需要你主动调整**：拿到结果先核对成员清单——核心芯片没带上它的去耦电容/上拉电阻（如电源芯片孤零零、显示屏幕缺周边）说明聚类不足，调大 linkDistance 重试（160/200）；邻居模块的器件混了进来（如给显示屏选出了旁边独立的 LDO 电源模块）说明过度合并，调小或保持 120 再用 select_primitives(mode=remove) 剔除。器件类型语义是复核依据：LDO/DCDC 是独立电源模块、去耦电容属于被服务的芯片、输入器件（按键）与输出器件（蜂鸣器）不同模块。**选中后本轮内不能直接调 propose_create_module**（会被拦截）——必须先结束回复提醒用户在画布上核对选区，待用户下一条消息确认后再出卡。', parameters: SELECT_MODULE_PARAMS as unknown as Record<string, unknown> },
+	{ name: 'select_primitives', description: '直接操作画布选区：按图元 id 选中/追加/剔除，或清空。只改选中状态，不做任何其他事。id 必须来自 read_schematic（元件 id 或走线 id）。整组替换用 mode=replace；微调选区（如把 AI 判定不属于本模块的器件剔除）用 mode=remove；配合 select_module 的返回成员清单使用。**选区改动后本轮内不能直接调 propose_create_module**（会被拦截）——必须先结束回复提醒用户核对，待用户确认后再出卡。', parameters: SELECT_PRIMITIVES_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'propose_export', description: '向用户出示目录 JSON 导出确认卡（不会真正写文件）。确认后另存一份 JSON，只含勾选模块的目录条目，不含工程文件。按需导出：传 cbbUuids 则卡上只列这些模块（推荐用法，如导出当前推荐方案/用户点名的模块）；仅当用户明确要导出全部目录时才省略 cbbUuids。', parameters: PROPOSE_EXPORT_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'self_check', description: '探测宿主 API 与桥接是否可用，返回诊断文本。', parameters: EMPTY_PARAMS as unknown as Record<string, unknown> },
 	{ name: 'compact_history', description: '折叠早期对话：用一段摘要替换较早的历史（最近几轮原样保留），防止上下文膨胀与早期信息丢失。上下文摘要显示轮数超过 8、或你发现缺少早期对话中的约定/结果时调用；把此前对话的完整摘要写入 summary。', parameters: COMPACT_HISTORY_PARAMS as unknown as Record<string, unknown> },
